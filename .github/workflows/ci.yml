@@ -174,7 +174,9 @@ jobs:
 
       - name: Release GCP Clippy build space
         if: runner.os == 'Linux' && runner.environment == 'self-hosted'
-        run: cargo clean --target-dir "$RUNNER_TEMP/cc-switch-clippy-target"
+        run: >-
+          cargo clean --manifest-path src-tauri/Cargo.toml
+          --target-dir "$RUNNER_TEMP/cc-switch-clippy-target"
 
       - name: Run tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
