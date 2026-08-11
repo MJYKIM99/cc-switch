@@ -310,6 +310,14 @@ struct SkillSourceIndex {
     metadata_matches: HashMap<String, Vec<PathBuf>>,
 }
 
+/// 技能源解析顺序取决于标识来源：仓库 discovery 提供真实相对路径，路径优先；
+/// skills.sh 提供的 skillId 可能来自 frontmatter name，因此 metadata 身份优先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillSourcePreference {
+    DirectPath,
+    MetadataName,
+}
+
 /// 导入已有 Skill 时，前端显式提交的启用应用选择
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -520,6 +528,66 @@ impl SkillService {
         Some(path.to_string())
     }
 
+    /// skills.sh API 的稳定 ID 形状是 `owner/repo/skillId`，而仓库 discovery 的
+    /// key 是 `owner/repo:directory`。保留这个差异即可决定解析顺序，不需要给
+    /// InstalledSkill 增加数据库字段或做迁移。
+    fn skill_source_preference(
+        id: &str,
+        owner: &str,
+        repo: &str,
+        raw_directory: &str,
+    ) -> SkillSourcePreference {
+        let Some(source_rel) = Self::sanitize_skill_source_path(raw_directory) else {
+            return SkillSourcePreference::DirectPath;
+        };
+        if source_rel.components().count() != 1 {
+            return SkillSourcePreference::DirectPath;
+        }
+        let Some(skill_id) = source_rel.file_name() else {
+            return SkillSourcePreference::DirectPath;
+        };
+        let expected = format!("{owner}/{repo}/{}", skill_id.to_string_lossy());
+
+        if id.eq_ignore_ascii_case(&expected) {
+            SkillSourcePreference::MetadataName
+        } else {
+            SkillSourcePreference::DirectPath
+        }
+    }
+
+    /// 从本应用生成的 GitHub 文档链接恢复上次实际安装的仓库内源目录。
+    ///
+    /// readme_url 来自数据库，不能直接 join：必须同时钉住 owner/repo/branch、要求
+    /// 末尾为 SKILL.md，再走相对路径校验。命中后可在更新时保持物理源身份，避免
+    /// 仓库后来新增同名目录时把 metadata-named Skill 静默替换掉。
+    fn source_dir_from_readme_url(
+        root: &Path,
+        readme_url: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Option<PathBuf> {
+        let blob_prefix = format!("https://github.com/{owner}/{repo}/blob/{branch}/");
+        let tree_prefix = format!("https://github.com/{owner}/{repo}/tree/{branch}/");
+        let doc_path = readme_url
+            .strip_prefix(&blob_prefix)
+            .or_else(|| readme_url.strip_prefix(&tree_prefix))?;
+        let doc_rel = Path::new(doc_path);
+        if doc_rel.file_name()? != std::ffi::OsStr::new("SKILL.md") {
+            return None;
+        }
+
+        let parent = doc_rel.parent()?;
+        let source = if parent.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            let source_rel = Self::sanitize_skill_source_path(&parent.to_string_lossy())?;
+            root.join(source_rel)
+        };
+
+        (source.is_dir() && source.join("SKILL.md").is_file()).then_some(source)
+    }
+
     // ========== 路径管理 ==========
 
     /// 获取 SSOT 目录（根据设置返回 ~/.cc-switch/skills/ 或 ~/.agents/skills/）
@@ -642,6 +710,12 @@ impl SkillService {
                     Some("checkZipContent"),
                 ))
             })?;
+        let source_preference = Self::skill_source_preference(
+            &skill.key,
+            &skill.repo_owner,
+            &skill.repo_name,
+            &skill.directory,
+        );
 
         // 检查数据库中是否已有同名 directory 的 skill（来自其他仓库）
         let existing_skills = db.get_all_installed_skills()?;
@@ -723,15 +797,19 @@ impl SkillService {
             repo_branch = used_branch;
 
             // 复制到 SSOT
-            let source =
-                Self::resolve_skill_source_dir(temp_dir, &skill.directory).ok_or_else(|| {
-                    let missing = temp_dir.join(&source_rel).display().to_string();
-                    anyhow!(format_skill_error(
-                        "SKILL_DIR_NOT_FOUND",
-                        &[("path", &missing)],
-                        Some("checkRepoUrl"),
-                    ))
-                })?;
+            let source = Self::resolve_skill_source_dir_with_preference(
+                temp_dir,
+                &skill.directory,
+                source_preference,
+            )
+            .ok_or_else(|| {
+                let missing = temp_dir.join(&source_rel).display().to_string();
+                anyhow!(format_skill_error(
+                    "SKILL_DIR_NOT_FOUND",
+                    &[("path", &missing)],
+                    Some("checkRepoUrl"),
+                ))
+            })?;
 
             let canonical_temp = temp_dir
                 .canonicalize()
@@ -1029,10 +1107,17 @@ impl SkillService {
             for skill in group_skills {
                 // 安装目录可能来自 frontmatter name。直接复用安装时的全树解析器；
                 // discovery 扫描会在父 Skill 处停止，不能作为嵌套 Skill 的前置过滤器。
+                let source_preference =
+                    Self::skill_source_preference(&skill.id, owner, name, &skill.directory);
+                let preferred_source = skill.readme_url.as_deref().and_then(|readme_url| {
+                    Self::source_dir_from_readme_url(temp_dir, readme_url, owner, name, branch)
+                });
                 let remote_skill_dir = match Self::resolve_skill_source_dir_for_update(
                     temp_dir,
                     &skill.directory,
                     name,
+                    preferred_source.as_deref(),
+                    source_preference,
                     source_index.as_ref(),
                 ) {
                     Some(path) => path,
@@ -1139,6 +1224,11 @@ impl SkillService {
         })??;
         let temp_dir = temp_guard.path();
         let source_index = Self::build_skill_source_index(temp_dir, MAX_SKILL_SCAN_DIRECTORIES);
+        let source_preference =
+            Self::skill_source_preference(&skill.id, &owner, &name, &skill.directory);
+        let preferred_source = skill.readme_url.as_deref().and_then(|readme_url| {
+            Self::source_dir_from_readme_url(temp_dir, readme_url, &owner, &name, &branch)
+        });
 
         // 与安装和更新检查使用同一个全树解析器，避免父 Skill 截断 discovery 扫描后
         // 误报嵌套 Skill 不存在。
@@ -1146,6 +1236,8 @@ impl SkillService {
             temp_dir,
             &skill.directory,
             &name,
+            preferred_source.as_deref(),
+            source_preference,
             source_index.as_ref(),
         ) {
             Some(source) => source,
@@ -1191,12 +1283,14 @@ impl SkillService {
         let skill_md = dest.join("SKILL.md");
         let (new_name, new_description) = Self::read_skill_name_desc(&skill_md, &skill.directory);
 
-        // 更新 readme_url
-        let doc_path = skill
-            .readme_url
-            .as_deref()
-            .and_then(Self::extract_doc_path_from_url)
-            .unwrap_or_else(|| format!("{}/SKILL.md", skill.directory.trim_end_matches('/')));
+        // 每次更新都从本次真实解析出的源目录刷新文档路径。metadata-named Skill
+        // 可以在仓库内移动而保持安装名不变，沿用旧 readme_url 会留下 404，并让
+        // 下一次更新失去可用于防同名目录劫持的物理源身份。
+        let doc_path = Self::choose_doc_path(
+            Self::doc_path_for_source(temp_dir, &source),
+            skill.readme_url.as_deref(),
+            &skill.directory,
+        );
         let readme_url = Self::build_skill_doc_url(&owner, &name, &used_branch, &doc_path);
 
         let updated_metadata = InstalledSkill {
@@ -2563,14 +2657,82 @@ impl SkillService {
         Some((install_name, direct))
     }
 
-    /// 使用一次完整扫描得到的索引解析非直接路径。只有唯一候选才可命中，避免
-    /// read_dir 顺序或部分扫描决定安装结果。
+    /// 判断指定源目录是否声明了安装名。共享索引存在时直接查表；索引无法建立但
+    /// 已保存的精确源路径仍存在时，只重读该路径自身的 metadata 做身份交叉检查。
+    fn source_declares_metadata_name(
+        source: &Path,
+        install_name: &str,
+        index: Option<&SkillSourceIndex>,
+    ) -> bool {
+        let lookup_key = install_name.to_ascii_lowercase();
+        if let Some(index) = index {
+            return index
+                .metadata_matches
+                .get(&lookup_key)
+                .is_some_and(|candidates| candidates.iter().any(|candidate| candidate == source));
+        }
+
+        Self::parse_skill_metadata_static(&source.join("SKILL.md"))
+            .ok()
+            .and_then(|metadata| metadata.name)
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(install_name))
+    }
+
+    /// 使用一次完整扫描得到的索引解析源目录。解析顺序由标识来源决定，所有模糊
+    /// 候选都 fail closed，避免 read_dir 顺序决定安装结果。
     fn resolve_indexed_skill_source(
         root: &Path,
         install_name: &str,
+        direct: Option<PathBuf>,
         index: &SkillSourceIndex,
+        preference: SkillSourcePreference,
     ) -> Option<PathBuf> {
         let lookup_key = install_name.to_ascii_lowercase();
+        if preference == SkillSourcePreference::DirectPath {
+            if let Some(direct) = direct {
+                return Some(direct);
+            }
+        }
+
+        let metadata_matches = index
+            .metadata_matches
+            .get(&lookup_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let resolve_metadata = || match metadata_matches {
+            [found] => {
+                log::info!(
+                    "Using metadata identity match for Skill '{}': {}",
+                    install_name,
+                    found.display()
+                );
+                Ok(Some(found.clone()))
+            }
+            [] => Ok(None),
+            _ => {
+                log::warn!(
+                    "Multiple Skill directories declare metadata name '{}'; refusing an arbitrary install",
+                    install_name
+                );
+                Err(())
+            }
+        };
+
+        // skills.sh 的 skillId 具有 metadata 身份语义。即使仓库后来出现同名物理
+        // 目录，也必须先选择唯一 metadata 候选，不能让直接路径静默劫持身份。
+        if preference == SkillSourcePreference::MetadataName {
+            match resolve_metadata() {
+                Ok(Some(found)) => return Some(found),
+                Ok(None) => {}
+                Err(()) => return None,
+            }
+        }
+
+        // metadata 没有声明该 ID 时仍兼容 skills.sh 中按目录生成的旧条目。
+        if let Some(direct) = direct {
+            return Some(direct);
+        }
+
         let directory_matches = index
             .directory_matches
             .get(&lookup_key)
@@ -2597,29 +2759,13 @@ impl SkillService {
             }
         }
 
-        // skills.sh 的 skillId 可能来自 frontmatter name，与实际目录名不同。
-        // 根目录也参与唯一性检查，避免根 Skill 被同名子目录意外替换。
-        let metadata_matches = index
-            .metadata_matches
-            .get(&lookup_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        match metadata_matches {
-            [found] => {
-                log::info!(
-                    "Skill directory '{}' not found by path or directory name, using metadata fallback: {}",
-                    install_name,
-                    found.display()
-                );
-                return Some(found.clone());
-            }
-            [] => {}
-            _ => {
-                log::warn!(
-                    "Multiple Skill directories declare metadata name '{}'; refusing an arbitrary install",
-                    install_name
-                );
-                return None;
+        // 仓库 discovery 以路径为身份；只有路径和目录名均未命中时才用 metadata
+        // fallback，保持普通仓库安装的既有语义。
+        if preference == SkillSourcePreference::DirectPath {
+            match resolve_metadata() {
+                Ok(Some(found)) => return Some(found),
+                Ok(None) => {}
+                Err(()) => return None,
             }
         }
 
@@ -2642,13 +2788,14 @@ impl SkillService {
         root: &Path,
         raw_directory: &str,
         index: Option<&SkillSourceIndex>,
+        preference: SkillSourcePreference,
     ) -> Option<PathBuf> {
         let (install_name, direct) = Self::prepare_skill_source_lookup(root, raw_directory)?;
-        if let Some(direct) = direct {
-            return Some(direct);
+        if preference == SkillSourcePreference::DirectPath && direct.is_some() {
+            return direct;
         }
 
-        Self::resolve_indexed_skill_source(root, &install_name, index?)
+        Self::resolve_indexed_skill_source(root, &install_name, direct, index?, preference)
     }
 
     /// 将 discoverable skill 的目录信息重新解析为解压目录中的真实源目录。
@@ -2658,14 +2805,27 @@ impl SkillService {
     /// 2. 按安装名递归查找名字匹配 **且** 含 `SKILL.md` 的目录；
     /// 3. 按 SKILL.md frontmatter `name` 唯一匹配目录；
     /// 4. 兜底：仓库根本身含 `SKILL.md`。
+    #[cfg(test)]
     fn resolve_skill_source_dir(root: &Path, raw_directory: &str) -> Option<PathBuf> {
+        Self::resolve_skill_source_dir_with_preference(
+            root,
+            raw_directory,
+            SkillSourcePreference::DirectPath,
+        )
+    }
+
+    fn resolve_skill_source_dir_with_preference(
+        root: &Path,
+        raw_directory: &str,
+        preference: SkillSourcePreference,
+    ) -> Option<PathBuf> {
         let (install_name, direct) = Self::prepare_skill_source_lookup(root, raw_directory)?;
-        if let Some(direct) = direct {
-            return Some(direct);
+        if preference == SkillSourcePreference::DirectPath && direct.is_some() {
+            return direct;
         }
 
         let index = Self::build_skill_source_index(root, MAX_SKILL_SCAN_DIRECTORIES)?;
-        Self::resolve_indexed_skill_source(root, &install_name, &index)
+        Self::resolve_indexed_skill_source(root, &install_name, direct, &index, preference)
     }
 
     /// 更新路径使用安装时的全树解析，但不能无条件沿用“仓库根就是唯一 Skill”的兜底。
@@ -2675,28 +2835,36 @@ impl SkillService {
         root: &Path,
         raw_directory: &str,
         repo_name: &str,
+        preferred_source: Option<&Path>,
+        preference: SkillSourcePreference,
         index: Option<&SkillSourceIndex>,
     ) -> Option<PathBuf> {
-        let source = Self::resolve_skill_source_dir_with_index(root, raw_directory, index)?;
-        if source != root {
-            return Some(source);
-        }
-
         let install_name = Self::sanitize_skill_source_path(raw_directory)?
             .file_name()?
             .to_string_lossy()
             .into_owned();
+        let preferred_source = preferred_source.filter(|source| {
+            source.starts_with(root)
+                && source.is_dir()
+                && source.join("SKILL.md").is_file()
+                && (preference == SkillSourcePreference::DirectPath
+                    || Self::source_declares_metadata_name(source, &install_name, index))
+        });
+        let source = match preferred_source {
+            Some(source) => source.to_path_buf(),
+            None => {
+                Self::resolve_skill_source_dir_with_index(root, raw_directory, index, preference)?
+            }
+        };
+        if source != root {
+            return Some(source);
+        }
+
         if install_name.eq_ignore_ascii_case(repo_name) {
             return Some(source);
         }
 
-        let lookup_key = install_name.to_ascii_lowercase();
-        index?
-            .metadata_matches
-            .get(&lookup_key)?
-            .iter()
-            .any(|candidate| candidate == root)
-            .then_some(source)
+        Self::source_declares_metadata_name(root, &install_name, index).then_some(source)
     }
 
     /// 由真实解析出的源目录推导 SKILL.md 在仓库内的相对文档路径（正斜杠）。
@@ -5030,6 +5198,58 @@ mod tests {
     }
 
     #[test]
+    fn skills_sh_metadata_identity_wins_over_unrelated_direct_path() {
+        let temp = tempdir().expect("tempdir");
+        let unrelated_direct = temp.path().join("foo");
+        let metadata_source = temp.path().join("skills");
+        write_skill(&unrelated_direct, "unrelated-direct-skill");
+        write_skill(&metadata_source, "foo");
+
+        let skills_sh_preference =
+            SkillService::skill_source_preference("owner/repo/foo", "owner", "repo", "foo");
+        assert_eq!(skills_sh_preference, SkillSourcePreference::MetadataName);
+        assert_eq!(
+            SkillService::resolve_skill_source_dir_with_preference(
+                temp.path(),
+                "foo",
+                skills_sh_preference,
+            )
+            .as_deref(),
+            Some(metadata_source.as_path()),
+            "skills.sh IDs must use their unique metadata identity before a same-name path"
+        );
+
+        assert_eq!(
+            SkillService::skill_source_preference("owner/repo:foo", "owner", "repo", "foo"),
+            SkillSourcePreference::DirectPath
+        );
+        assert_eq!(
+            SkillService::resolve_skill_source_dir(temp.path(), "foo").as_deref(),
+            Some(unrelated_direct.as_path()),
+            "ordinary repository discovery must retain explicit-path priority"
+        );
+    }
+
+    #[test]
+    fn skills_sh_metadata_identity_rejects_ambiguous_metadata_before_direct_path() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("foo"), "unrelated-direct-skill");
+        write_skill(&temp.path().join("catalog-a"), "foo");
+        write_skill(&temp.path().join("catalog-b"), "foo");
+
+        let resolved = SkillService::resolve_skill_source_dir_with_preference(
+            temp.path(),
+            "foo",
+            SkillSourcePreference::MetadataName,
+        );
+
+        assert!(
+            resolved.is_none(),
+            "ambiguous skills.sh metadata identities must not fall through to a direct path"
+        );
+    }
+
+    #[test]
     fn resolve_skill_source_dir_for_update_finds_target_below_parent_skill() {
         let temp = tempdir().expect("tempdir");
         write_skill(temp.path(), "parent-skill");
@@ -5041,6 +5261,8 @@ mod tests {
             temp.path(),
             "nested-update-skill",
             "repository-name",
+            None,
+            SkillSourcePreference::DirectPath,
             index.as_ref(),
         )
         .expect("update lookup must scan below a parent directory that is also a Skill");
@@ -5058,6 +5280,8 @@ mod tests {
             temp.path(),
             "removed-nested-skill",
             "repository-name",
+            None,
+            SkillSourcePreference::DirectPath,
             index.as_ref(),
         );
 
@@ -5081,6 +5305,8 @@ mod tests {
                 temp.path(),
                 directory,
                 repo_name,
+                None,
+                SkillSourcePreference::DirectPath,
                 index.as_ref(),
             );
 
@@ -5090,6 +5316,111 @@ mod tests {
                 "a root Skill matching the repository or metadata name should remain updateable"
             );
         }
+    }
+
+    #[test]
+    fn update_keeps_saved_source_when_duplicate_metadata_directory_appears() {
+        let temp = tempdir().expect("tempdir");
+        let installed_source = temp.path().join("skills");
+        write_skill(&installed_source, "foo");
+        write_skill(&temp.path().join("foo"), "foo");
+        let index = SkillService::build_skill_source_index(temp.path(), MAX_SKILL_SCAN_DIRECTORIES);
+        let preferred_source = SkillService::source_dir_from_readme_url(
+            temp.path(),
+            "https://github.com/owner/repo/blob/main/skills/SKILL.md",
+            "owner",
+            "repo",
+            "main",
+        );
+
+        let resolved = SkillService::resolve_skill_source_dir_for_update(
+            temp.path(),
+            "foo",
+            "repo",
+            preferred_source.as_deref(),
+            SkillSourcePreference::MetadataName,
+            index.as_ref(),
+        );
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(installed_source.as_path()),
+            "the persisted physical source must disambiguate a later same-name addition"
+        );
+    }
+
+    #[test]
+    fn update_refreshes_doc_path_after_metadata_named_source_moves() {
+        let temp = tempdir().expect("tempdir");
+        let moved_source = temp.path().join("new/catalog/generic-directory");
+        write_skill(&moved_source, "foo");
+        write_skill(&temp.path().join("foo"), "unrelated-direct-skill");
+        let old_readme = "https://github.com/owner/repo/blob/main/old/path/SKILL.md";
+        assert!(
+            SkillService::source_dir_from_readme_url(
+                temp.path(),
+                old_readme,
+                "owner",
+                "repo",
+                "main",
+            )
+            .is_none(),
+            "the deleted old source path must not be reused"
+        );
+        let index = SkillService::build_skill_source_index(temp.path(), MAX_SKILL_SCAN_DIRECTORIES);
+        let resolved = SkillService::resolve_skill_source_dir_for_update(
+            temp.path(),
+            "foo",
+            "repo",
+            None,
+            SkillSourcePreference::MetadataName,
+            index.as_ref(),
+        )
+        .expect("the moved unique metadata source should resolve");
+        let doc_path = SkillService::choose_doc_path(
+            SkillService::doc_path_for_source(temp.path(), &resolved),
+            Some(old_readme),
+            "foo",
+        );
+
+        assert_eq!(resolved, moved_source);
+        assert_eq!(doc_path, "new/catalog/generic-directory/SKILL.md");
+    }
+
+    #[test]
+    fn source_dir_from_readme_url_requires_exact_coordinates_and_safe_path() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("skills/foo");
+        write_skill(&source, "foo");
+
+        assert_eq!(
+            SkillService::source_dir_from_readme_url(
+                temp.path(),
+                "https://github.com/owner/repo/blob/feature/topic/skills/foo/SKILL.md",
+                "owner",
+                "repo",
+                "feature/topic",
+            )
+            .as_deref(),
+            Some(source.as_path()),
+            "branches containing slashes must preserve the repository-relative document path"
+        );
+        assert!(SkillService::source_dir_from_readme_url(
+            temp.path(),
+            "https://github.com/other/repo/blob/feature/topic/skills/foo/SKILL.md",
+            "owner",
+            "repo",
+            "feature/topic",
+        )
+        .is_none());
+        assert!(SkillService::source_dir_from_readme_url(
+            temp.path(),
+            "https://github.com/owner/repo/blob/feature/topic/../skills/foo/SKILL.md",
+            "owner",
+            "repo",
+            "feature/topic",
+        )
+        .is_none());
     }
 
     #[test]
