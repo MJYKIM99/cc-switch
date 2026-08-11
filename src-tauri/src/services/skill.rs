@@ -9,7 +9,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
+use std::io::{BufRead, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -273,6 +275,12 @@ const SKILL_BACKUP_RETAIN_COUNT: usize = 20;
 /// 取值对齐 `webdav_sync/archive.rs` 里同款保护的量级。
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// 源目录解析允许访问的目录数。远端归档本身最多有 MAX_ARCHIVE_ENTRIES 个条目，
+/// 再加一个解压后的临时根目录；超过这个数量时拒绝继续扫描，避免异常目录树拖垮安装。
+const MAX_SKILL_SCAN_DIRECTORIES: usize = MAX_ARCHIVE_ENTRIES + 1;
+/// YAML frontmatter 应是很短的文件头。只读取到独立结束分隔行并限制总字节数，
+/// 避免 skills.sh metadata fallback 为一个超大 SKILL.md 分配数百 MiB 内存。
+const MAX_SKILL_FRONTMATTER_BYTES: usize = 64 * 1024;
 /// symlink 目标就是一条路径，几十字节就够；给到 4 KiB 是宽松上限。
 /// 必须有这个上限：zip 2.4.2 的 `make_reader` 不按声明的 uncompressed_size
 /// 截断读取，所以一个打了 symlink 标志、deflate 流却能膨胀到数 GB 的条目，
@@ -1013,13 +1021,10 @@ impl SkillService {
             let _ = self.scan_dir_recursive(temp_dir, temp_dir, &repo, &mut remote_skills);
 
             for skill in group_skills {
-                // 在远程仓库中找到匹配的 Skill 目录
-                let remote_match = remote_skills.iter().find(|rs| {
-                    // 匹配方式：安装名称的最后一段
-                    let remote_install_name =
-                        rs.directory.rsplit('/').next().unwrap_or(&rs.directory);
-                    remote_install_name.eq_ignore_ascii_case(&skill.directory)
-                });
+                // 在远程仓库中找到匹配的 Skill。安装目录保存的是 skills.sh skillId，
+                // 它可能来自 frontmatter name，并不一定等于仓库目录 basename。
+                let remote_match =
+                    Self::find_remote_skill_by_install_name(&remote_skills, &skill.directory);
 
                 let remote_skill_dir = match remote_match {
                     Some(rs) => match Self::resolve_skill_source_dir(temp_dir, &rs.directory) {
@@ -1133,19 +1138,16 @@ impl SkillService {
         let mut remote_skills: Vec<DiscoverableSkill> = Vec::new();
         let _ = self.scan_dir_recursive(temp_dir, temp_dir, &repo, &mut remote_skills);
 
-        let remote_match = remote_skills
-            .iter()
-            .find(|rs| {
-                let remote_install_name = rs.directory.rsplit('/').next().unwrap_or(&rs.directory);
-                remote_install_name.eq_ignore_ascii_case(&skill.directory)
-            })
-            .ok_or_else(|| {
-                anyhow!(format_skill_error(
-                    "SKILL_DIR_NOT_FOUND",
-                    &[("path", &skill.directory)],
-                    Some("checkRepoUrl"),
-                ))
-            })?;
+        let remote_match =
+            Self::find_remote_skill_by_install_name(&remote_skills, &skill.directory).ok_or_else(
+                || {
+                    anyhow!(format_skill_error(
+                        "SKILL_DIR_NOT_FOUND",
+                        &[("path", &skill.directory)],
+                        Some("checkRepoUrl"),
+                    ))
+                },
+            )?;
 
         let source =
             Self::resolve_skill_source_dir(temp_dir, &remote_match.directory).ok_or_else(|| {
@@ -1413,7 +1415,7 @@ impl SkillService {
         let backup_path = Self::backup_path_for_id(backup_id)?;
         let metadata = Self::read_backup_metadata(&backup_path)?;
         let backup_skill_dir = backup_path.join("skill");
-        if !backup_skill_dir.join("SKILL.md").exists() {
+        if Self::exact_skill_manifest_path(&backup_skill_dir)?.is_none() {
             return Err(anyhow!(
                 "Skill backup is invalid or missing SKILL.md: {}",
                 backup_path.display()
@@ -1549,10 +1551,9 @@ impl SkillService {
                     continue;
                 }
 
-                let skill_md = path.join("SKILL.md");
-                if !skill_md.exists() {
+                let Some(skill_md) = Self::exact_skill_manifest_path(&path).ok().flatten() else {
                     continue;
-                }
+                };
                 let (name, description) = Self::read_skill_name_desc(&skill_md, &dir_name);
 
                 unmanaged
@@ -1629,7 +1630,11 @@ impl SkillService {
                 Some(p) => p,
                 None => continue,
             };
-            if !source.join("SKILL.md").exists() {
+            if Self::exact_skill_manifest_path(&source)
+                .ok()
+                .flatten()
+                .is_none()
+            {
                 log::warn!(
                     "Skip importing '{}' because source '{}' has no SKILL.md",
                     dir_name,
@@ -1645,7 +1650,14 @@ impl SkillService {
             }
 
             // 解析元数据
-            let skill_md = dest.join("SKILL.md");
+            let Some(skill_md) = Self::exact_skill_manifest_path(&dest)? else {
+                log::warn!(
+                    "Skip importing '{}' because destination '{}' has no exact SKILL.md",
+                    dir_name,
+                    dest.display()
+                );
+                continue;
+            };
             let (name, description) = Self::read_skill_name_desc(&skill_md, &dir_name);
 
             // 启用状态仅信任用户本次显式选择，不再根据“在哪些位置找到”自动推断。
@@ -1817,8 +1829,7 @@ impl SkillService {
             return Err(anyhow!("Skill 不存在于 SSOT: {directory}"));
         }
 
-        let manifest = source.join("SKILL.md");
-        if !manifest.is_file() {
+        if Self::exact_skill_manifest_path(source)?.is_none() {
             return Err(anyhow!(
                 "Skill 源目录缺少 SKILL.md，拒绝同步以避免覆盖目标目录: {}",
                 source.display()
@@ -2106,9 +2117,7 @@ impl SkillService {
         repo: &SkillRepo,
         skills: &mut Vec<DiscoverableSkill>,
     ) -> Result<()> {
-        let skill_md = current_dir.join("SKILL.md");
-
-        if skill_md.exists() {
+        if let Some(skill_md) = Self::exact_skill_manifest_path(current_dir)? {
             let directory = if current_dir == base_dir {
                 repo.name.clone()
             } else {
@@ -2173,24 +2182,88 @@ impl SkillService {
         Self::parse_skill_metadata_static(path)
     }
 
+    /// 在所有平台上按字节/码元精确识别规范文件名 `SKILL.md`。
+    ///
+    /// `Path::join("SKILL.md").is_file()` 会服从宿主文件系统大小写规则：同一个
+    /// `skill.md` 在默认 macOS/Windows 上被接受、在 Linux 上却被拒绝。枚举目录项
+    /// 并精确比较名称可消除这种设备差异；同时不接受 manifest 文件 symlink。
+    fn exact_skill_manifest_path(directory: &Path) -> Result<Option<PathBuf>> {
+        let entries = fs::read_dir(directory)
+            .with_context(|| format!("failed to scan Skill directory {}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to read Skill directory entry in {}",
+                    directory.display()
+                )
+            })?;
+            if entry.file_name() != OsStr::new("SKILL.md") {
+                continue;
+            }
+            let file_type = entry.file_type().with_context(|| {
+                format!(
+                    "failed to inspect Skill manifest {}",
+                    entry.path().display()
+                )
+            })?;
+            return Ok(file_type.is_file().then(|| entry.path()));
+        }
+        Ok(None)
+    }
+
     /// 静态方法：解析技能元数据
     fn parse_skill_metadata_static(path: &Path) -> Result<SkillMetadata> {
-        let content = fs::read_to_string(path)?;
-        let content = content.trim_start_matches('\u{feff}');
-
-        let parts: Vec<&str> = content.splitn(3, "---").collect();
-        if parts.len() < 3 {
-            return Ok(SkillMetadata {
+        fn empty_metadata() -> SkillMetadata {
+            SkillMetadata {
                 name: None,
                 description: None,
-            });
+            }
         }
 
-        let front_matter = parts[1].trim();
-        let meta: SkillMetadata = serde_yaml::from_str(front_matter).unwrap_or(SkillMetadata {
-            name: None,
-            description: None,
-        });
+        fn is_delimiter_line(line: &str) -> bool {
+            line.trim_end_matches(['\r', '\n', ' ', '\t']) == "---"
+        }
+
+        // `Take` 必须包在 BufReader 外层，这样即使首行没有换行，read_line 也最多
+        // 分配 limit + 1 字节。找到结束分隔行后立即停止，不读取 Markdown 正文。
+        let file = fs::File::open(path)?;
+        let mut reader =
+            std::io::BufReader::new(file).take((MAX_SKILL_FRONTMATTER_BYTES + 1) as u64);
+        let mut consumed = 0usize;
+
+        let mut opening_line = String::new();
+        let bytes = reader.read_line(&mut opening_line)?;
+        consumed += bytes;
+        if bytes == 0 || consumed > MAX_SKILL_FRONTMATTER_BYTES {
+            return Ok(empty_metadata());
+        }
+        let opening_line = opening_line
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&opening_line);
+        if !is_delimiter_line(opening_line) {
+            return Ok(empty_metadata());
+        }
+
+        let mut front_matter = String::new();
+        loop {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line)?;
+            consumed += bytes;
+            if bytes == 0 || consumed > MAX_SKILL_FRONTMATTER_BYTES {
+                log::warn!(
+                    "Ignoring missing or oversized Skill frontmatter in '{}'",
+                    path.display()
+                );
+                return Ok(empty_metadata());
+            }
+            if is_delimiter_line(&line) {
+                break;
+            }
+            front_matter.push_str(&line);
+        }
+
+        let meta: SkillMetadata =
+            serde_yaml::from_str(front_matter.trim()).unwrap_or_else(|_| empty_metadata());
 
         Ok(meta)
     }
@@ -2253,6 +2326,39 @@ impl SkillService {
         // `\` 在 Linux/macOS 上不是分隔符，会被当成合法单段名放行，
         // 但同一个值同步/还原到 Windows 上就变成了嵌套路径。
         if trimmed.contains('/') || trimmed.contains('\\') {
+            return None;
+        }
+
+        // SSOT/备份可能跨 macOS、Linux、Windows 同步，因此即使当前文件系统允许，
+        // 也不能落盘 Windows 禁止的字符、设备名或超过常见单段上限的名称。
+        if trimmed
+            .chars()
+            .any(|character| character.is_control() || "<>:\"|?*".contains(character))
+            || trimmed.ends_with('.')
+            || trimmed.len() > 255
+            || trimmed.encode_utf16().count() > 255
+        {
+            return None;
+        }
+
+        let windows_stem = trimmed
+            .split('.')
+            .next()
+            .unwrap_or(trimmed)
+            .to_ascii_uppercase();
+        let numbered_device = ["COM", "LPT"].iter().any(|prefix| {
+            windows_stem.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+        if matches!(
+            windows_stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+        ) || numbered_device
+        {
             return None;
         }
 
@@ -2401,36 +2507,170 @@ impl SkillService {
         Ok(())
     }
 
-    /// 在目录树中查找名称匹配且包含 SKILL.md 的子目录
+    /// 扫描仓库中的 Skill 目录，同时收集目录 basename 与 frontmatter name 候选。
     ///
-    /// 用于 skills.sh 安装回退：API 只返回 skillId（如 "find-skills"），
-    /// 但实际文件可能在仓库子目录中（如 "skills/find-skills"）。
-    fn find_skill_dir_by_name(root: &Path, target_name: &str) -> Option<PathBuf> {
-        fn walk(dir: &Path, target: &str, depth: usize) -> Option<PathBuf> {
-            if depth > 3 {
+    /// 不使用固定深度：合法 Skill 可以位于任意深度；改用目录数量预算限制工作量。
+    /// 迭代遍历避免深目录耗尽调用栈，`DirEntry::file_type` 则确保不跟随 symlink。
+    /// 返回 None 表示目录树无法被完整、可信地扫描，此时调用方必须拒绝猜测。
+    fn find_skill_source_candidates(
+        root: &Path,
+        target_name: &str,
+        max_directories: usize,
+    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut scanned_directories = 0usize;
+        let mut directory_matches = Vec::new();
+        let mut metadata_matches = Vec::new();
+
+        while let Some(dir) = pending.pop() {
+            scanned_directories += 1;
+            if scanned_directories > max_directories {
+                log::warn!("Skill source scan exceeded directory limit {max_directories}");
                 return None;
             }
-            let entries = fs::read_dir(dir).ok()?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
+
+            let skill_md = match Self::exact_skill_manifest_path(&dir) {
+                Ok(skill_md) => skill_md,
+                Err(error) => {
+                    log::warn!(
+                        "Unable to inspect Skill manifest in '{}': {error}",
+                        dir.display()
+                    );
+                    return None;
                 }
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with('.') {
-                    continue;
+            };
+            if let Some(skill_md) = skill_md {
+                if dir != root
+                    && dir.file_name().is_some_and(|name| {
+                        name.to_string_lossy().eq_ignore_ascii_case(target_name)
+                    })
+                {
+                    directory_matches.push(dir.clone());
                 }
-                if name_str.eq_ignore_ascii_case(target) && path.join("SKILL.md").exists() {
-                    return Some(path);
-                }
-                if let Some(found) = walk(&path, target, depth + 1) {
-                    return Some(found);
+
+                match Self::parse_skill_metadata_static(&skill_md) {
+                    Ok(metadata) => {
+                        if metadata
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.trim().eq_ignore_ascii_case(target_name))
+                        {
+                            metadata_matches.push(dir.clone());
+                        }
+                    }
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::InvalidData
+                        }) =>
+                    {
+                        // 非 UTF-8 的 SKILL.md 本身不是有效 metadata 候选；忽略它，
+                        // 但不能让它阻断仓库中另一个有效 Skill 的安装。
+                        log::warn!(
+                            "Ignoring invalid UTF-8 Skill metadata '{}': {error}",
+                            skill_md.display()
+                        );
+                    }
+                    Err(error) => {
+                        // 权限、文件锁或竞态意味着扫描不完整，不能继续做唯一性判断。
+                        log::warn!(
+                            "Unable to read Skill metadata '{}': {error}",
+                            skill_md.display()
+                        );
+                        return None;
+                    }
                 }
             }
-            None
+
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    log::warn!(
+                        "Unable to scan Skill source directory '{}': {error}",
+                        dir.display()
+                    );
+                    return None;
+                }
+            };
+            let mut children = Vec::new();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        log::warn!(
+                            "Unable to read Skill source directory entry in '{}': {error}",
+                            dir.display()
+                        );
+                        return None;
+                    }
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        log::warn!(
+                            "Unable to inspect Skill source path '{}': {error}",
+                            entry.path().display()
+                        );
+                        return None;
+                    }
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                children.push(entry.path());
+            }
+
+            // read_dir 顺序不受保证；排序让诊断信息和测试在不同文件系统上一致。
+            children.sort();
+            pending.extend(children.into_iter().rev());
         }
-        walk(root, target_name, 0)
+
+        Some((directory_matches, metadata_matches))
+    }
+
+    /// 以安装目录名匹配远端扫描结果。目录 basename 保持最高优先级；只有它没有
+    /// 命中时才按 frontmatter 显示名回退。两个层级都只接受唯一候选。
+    fn find_remote_skill_by_install_name<'a>(
+        remote_skills: &'a [DiscoverableSkill],
+        install_name: &str,
+    ) -> Option<&'a DiscoverableSkill> {
+        let directory_matches: Vec<_> = remote_skills
+            .iter()
+            .filter(|skill| {
+                skill
+                    .directory
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&skill.directory)
+                    .eq_ignore_ascii_case(install_name)
+            })
+            .collect();
+        match directory_matches.as_slice() {
+            [matched] => return Some(*matched),
+            [] => {}
+            _ => {
+                log::warn!(
+                    "Multiple remote Skill directories match install name '{}'; refusing an arbitrary update",
+                    install_name
+                );
+                return None;
+            }
+        }
+
+        let metadata_matches: Vec<_> = remote_skills
+            .iter()
+            .filter(|skill| skill.name.trim().eq_ignore_ascii_case(install_name))
+            .collect();
+        match metadata_matches.as_slice() {
+            [matched] => Some(*matched),
+            [] => None,
+            _ => {
+                log::warn!(
+                    "Multiple remote Skills declare metadata name '{}'; refusing an arbitrary update",
+                    install_name
+                );
+                None
+            }
+        }
     }
 
     /// 将 discoverable skill 的目录信息重新解析为解压目录中的真实源目录。
@@ -2438,7 +2678,8 @@ impl SkillService {
     /// **核心原则：返回的目录必定含 `SKILL.md`**（以 SKILL.md 为锚点）。解析顺序：
     /// 1. 直接相对路径命中（如 `skills/foo`），校验含 `SKILL.md`——明确路径优先；
     /// 2. 按安装名递归查找名字匹配 **且** 含 `SKILL.md` 的目录；
-    /// 3. 兜底：仓库根本身含 `SKILL.md`。
+    /// 3. 按 SKILL.md frontmatter `name` 唯一匹配目录；
+    /// 4. 兜底：仓库根本身含 `SKILL.md`。
     fn resolve_skill_source_dir(root: &Path, raw_directory: &str) -> Option<PathBuf> {
         let source_rel = Self::sanitize_skill_source_path(raw_directory)?;
         let install_name = source_rel
@@ -2448,22 +2689,65 @@ impl SkillService {
         // 1. 直接相对路径命中（明确路径优先）——必须校验 SKILL.md，否则同名空壳目录
         //    （如 ast-grep/agent-skill 根下的 plugin 包目录 ast-grep/）会被误判为源目录。
         let direct = root.join(&source_rel);
-        if direct.is_dir() && direct.join("SKILL.md").is_file() {
+        if direct.is_dir()
+            && Self::exact_skill_manifest_path(&direct)
+                .ok()
+                .flatten()
+                .is_some()
+        {
             return Some(direct);
         }
 
-        // 2. 按名字递归查找（find_skill_dir_by_name 已校验 SKILL.md）
-        if let Some(found) = Self::find_skill_dir_by_name(root, &install_name) {
-            log::info!(
-                "Skill directory '{}' not found at direct path, using fallback: {}",
-                install_name,
-                found.display()
-            );
-            return Some(found);
+        let (directory_matches, metadata_matches) =
+            Self::find_skill_source_candidates(root, &install_name, MAX_SKILL_SCAN_DIRECTORIES)?;
+
+        // 2. 按名字递归查找。只接受唯一候选，避免 read_dir 的平台相关顺序决定结果。
+        match directory_matches.as_slice() {
+            [found] => {
+                log::info!(
+                    "Skill directory '{}' not found at direct path, using fallback: {}",
+                    install_name,
+                    found.display()
+                );
+                return Some(found.clone());
+            }
+            [] => {}
+            _ => {
+                log::warn!(
+                    "Multiple Skill directories match install name '{}'; refusing an arbitrary install",
+                    install_name
+                );
+                return None;
+            }
         }
 
-        // 3. 兜底：仓库根本身是 skill
-        if root.join("SKILL.md").is_file() {
+        // 3. skills.sh 的 skillId 可能来自 frontmatter name，与实际目录名不同。
+        //    根目录也参与唯一性检查，避免根 Skill 被同名子目录意外替换。
+        match metadata_matches.as_slice() {
+            [found] => {
+                log::info!(
+                    "Skill directory '{}' not found by path or directory name, using metadata fallback: {}",
+                    install_name,
+                    found.display()
+                );
+                return Some(found.clone());
+            }
+            [] => {}
+            _ => {
+                log::warn!(
+                    "Multiple Skill directories declare metadata name '{}'; refusing an arbitrary install",
+                    install_name
+                );
+                return None;
+            }
+        }
+
+        // 4. 兜底：仓库根本身是 skill
+        if Self::exact_skill_manifest_path(root)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             log::info!(
                 "Skill directory '{}' not found, but SKILL.md exists at root, using repo root",
                 install_name,
@@ -2694,6 +2978,71 @@ impl SkillService {
         Ok(())
     }
 
+    /// 在真正写盘前拒绝大小写别名路径。
+    ///
+    /// 同一个 ZIP 在 Linux 上会把 `SKILL.md` / `skill.md` 解成两个文件，在默认
+    /// macOS/Windows 文件系统上却会让后一个覆盖前一个。逐级登记目录别名还能挡住
+    /// `Skills/a` / `skills/b` 这种父目录先发生合并的情况，确保后续精确文件名校验
+    /// 不会被宿主文件系统的大小写语义绕过。
+    fn validate_portable_archive_paths<R: std::io::Read + std::io::Seek>(
+        archive: &mut zip::ZipArchive<R>,
+        strip_root: Option<&str>,
+    ) -> Result<()> {
+        let mut aliases: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+
+        for index in 0..archive.len() {
+            let file = archive.by_index(index)?;
+            let Some(safe_path) = file.enclosed_name() else {
+                continue;
+            };
+            let relative_path = if let Some(root) = strip_root {
+                let Ok(relative) = safe_path.strip_prefix(root) else {
+                    continue;
+                };
+                relative
+            } else {
+                safe_path.as_path()
+            };
+
+            // 解压器会跳过这些条目；别让无效路径参与别名判定并误伤合法内容。
+            if relative_path.as_os_str().is_empty()
+                || relative_path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                continue;
+            }
+
+            let mut folded_prefix = Vec::new();
+            let mut original_prefix = Vec::new();
+            for component in relative_path.components() {
+                let Component::Normal(name) = component else {
+                    continue;
+                };
+                let original = name.to_string_lossy().into_owned();
+                let folded = original.to_lowercase();
+                original_prefix.push(original);
+                folded_prefix.push(folded);
+
+                if let Some(existing) = aliases.get(&folded_prefix) {
+                    if existing != &original_prefix {
+                        let path = original_prefix.join("/");
+                        let existing_path = existing.join("/");
+                        return Err(anyhow!(format_skill_error(
+                            "ARCHIVE_PATH_COLLISION",
+                            &[("path", &path), ("existing_path", &existing_path)],
+                            Some("checkZipContent"),
+                        )));
+                    }
+                } else {
+                    aliases.insert(folded_prefix.clone(), original_prefix.clone());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// 把 GitHub 仓库归档解压到 `dest`（剥掉归档自带的一层根目录）。
     ///
     /// 与 `download_and_extract` 分离，使 zip-slip 防护可在不联网的情况下被单测覆盖。
@@ -2725,6 +3074,7 @@ impl SkillService {
                 Some("checkZipContent"),
             )));
         }
+        Self::validate_portable_archive_paths(&mut archive, Some(&root_name))?;
         let mut total_bytes: u64 = 0;
 
         // 第一遍：解压普通文件和目录，收集 symlink 条目
@@ -3107,12 +3457,10 @@ impl SkillService {
 
         for skill_dir in skill_dirs {
             // 解析元数据（提前解析，用于确定安装名）
-            let skill_md = skill_dir.join("SKILL.md");
-            let meta = if skill_md.exists() {
-                Self::parse_skill_metadata_static(&skill_md).ok()
-            } else {
-                None
-            };
+            let skill_md = Self::exact_skill_manifest_path(&skill_dir)?;
+            let meta = skill_md
+                .as_deref()
+                .and_then(|path| Self::parse_skill_metadata_static(path).ok());
 
             // 获取目录名称作为安装名
             // 当 SKILL.md 在 ZIP 根目录时，skill_dir == temp_dir，
@@ -3257,6 +3605,7 @@ impl SkillService {
                 Some("checkZipContent"),
             )));
         }
+        Self::validate_portable_archive_paths(&mut archive, None)?;
 
         // 守卫持有到解压全部成功为止：中途任何 `?` 都会让它清掉半成品目录。
         // 原来在这里就 keep()，超限或解压出错都会留下永久残留。
@@ -3321,8 +3670,7 @@ impl SkillService {
     /// 递归扫描辅助函数
     fn scan_skills_recursive(current: &Path, results: &mut Vec<PathBuf>) -> Result<()> {
         // 检查当前目录是否包含 SKILL.md
-        let skill_md = current.join("SKILL.md");
-        if skill_md.exists() {
+        if Self::exact_skill_manifest_path(current)?.is_some() {
             results.push(current.to_path_buf());
             // 找到后不再递归子目录（一个 skill 目录）
             return Ok(());
@@ -3596,7 +3944,11 @@ pub fn migrate_skills_to_ssot(db: &Arc<Database>) -> Result<usize> {
             if dir_name.starts_with('.') {
                 continue;
             }
-            if !path.join("SKILL.md").exists() {
+            if SkillService::exact_skill_manifest_path(&path)
+                .ok()
+                .flatten()
+                .is_none()
+            {
                 continue;
             }
             if has_snapshot && !discovered.contains_key(&dir_name) {
@@ -3627,9 +3979,12 @@ pub fn migrate_skills_to_ssot(db: &Arc<Database>) -> Result<usize> {
     let mut count = 0;
     for (directory, apps) in discovered {
         let ssot_path = ssot_dir.join(&directory);
-        let skill_md = ssot_path.join("SKILL.md");
-
-        let (name, description) = SkillService::read_skill_name_desc(&skill_md, &directory);
+        // 快照可以合法地只恢复数据库而不带 SSOT 文件；保持这类记录，使后续更新
+        // 检查能重建缺失目录。若磁盘上只有错误大小写的 manifest，也不得跨平台解析它。
+        let (name, description) = match SkillService::exact_skill_manifest_path(&ssot_path) {
+            Ok(Some(skill_md)) => SkillService::read_skill_name_desc(&skill_md, &directory),
+            Ok(None) | Err(_) => (directory.clone(), None),
+        };
 
         let (id, repo_owner, repo_name, repo_branch, readme_url) =
             build_repo_info_from_lock(&agents_lock, &directory);
@@ -3896,6 +4251,32 @@ mod tests {
                 .join("escaped-one-level.txt")
                 .exists(),
             "single-`..` entry must not escape dest (enclosed_name allows it)"
+        );
+    }
+
+    #[test]
+    fn extract_repo_archive_rejects_case_colliding_entries() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default();
+            zip.start_file("repo-main/skill/SKILL.md", opts).unwrap();
+            zip.write_all(b"---\nname: intended\n---\n").unwrap();
+            zip.start_file("repo-main/skill/skill.md", opts).unwrap();
+            zip.write_all(b"---\nname: shadow\n---\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(buf)).expect("archive parses");
+        let err = SkillService::extract_repo_archive(archive, temp.path())
+            .expect_err("case-colliding paths must not extract differently by filesystem");
+        assert!(
+            err.to_string().contains("ARCHIVE_PATH_COLLISION"),
+            "unexpected error: {err}"
         );
     }
 
@@ -4190,6 +4571,34 @@ mod tests {
     }
 
     #[test]
+    fn extract_local_zip_rejects_case_colliding_entries() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default();
+            zip.start_file("skill/SKILL.md", opts).unwrap();
+            zip.write_all(b"---\nname: intended\n---\n").unwrap();
+            zip.start_file("skill/skill.md", opts).unwrap();
+            zip.write_all(b"---\nname: shadow\n---\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let zip_path = temp.path().join("case-collision.zip");
+        fs::write(&zip_path, &buf).expect("write zip");
+
+        let err = SkillService::extract_local_zip(&zip_path)
+            .expect_err("case-colliding paths must not extract differently by filesystem");
+        assert!(
+            err.to_string().contains("ARCHIVE_PATH_COLLISION"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn extract_local_zip_rejects_too_many_entries() {
         // 本地 ZIP 走的是另一个解压器，条目上限曾只加在远端归档那条路径上。
         use std::io::Write;
@@ -4225,6 +4634,161 @@ mod tests {
             format!("---\nname: {name}\ndescription: Test skill\n---\n"),
         )
         .expect("write SKILL.md");
+    }
+
+    fn discoverable_skill(directory: &str, name: &str) -> DiscoverableSkill {
+        DiscoverableSkill {
+            key: format!("owner/repo:{directory}"),
+            name: name.to_string(),
+            description: String::new(),
+            directory: directory.to_string(),
+            readme_url: None,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            repo_branch: "main".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_requires_frontmatter_at_file_start() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "# Body heading\n---\nname: phantom-skill\n---\nBody\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert!(
+            metadata.name.is_none(),
+            "horizontal rules in the Markdown body must not be treated as frontmatter"
+        );
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_allows_delimiter_text_inside_yaml_value() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: marker-skill\ndescription: \"contains --- inside\"\n---\nBody\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert_eq!(metadata.name.as_deref(), Some("marker-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("contains --- inside"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_accepts_bom_and_crlf_delimiters() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "\u{feff}---\r\nname: portable-skill\r\ndescription: Portable\r\n---\r\nBody\r\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert_eq!(metadata.name.as_deref(), Some("portable-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("Portable"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_rejects_oversized_frontmatter() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        let oversized = "x".repeat(MAX_SKILL_FRONTMATTER_BYTES);
+        fs::write(
+            &skill_md,
+            format!("---\nname: oversized-skill\ndescription: {oversized}\n---\nBody\n"),
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert!(
+            metadata.name.is_none(),
+            "oversized frontmatter must be ignored instead of fully allocated"
+        );
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_stops_reading_at_closing_delimiter() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        let mut contents = b"---\nname: bounded-skill\ndescription: Bounded\n---\n".to_vec();
+        contents.extend(std::iter::repeat_n(0xff, MAX_SKILL_FRONTMATTER_BYTES * 2));
+        fs::write(&skill_md, contents).expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata header");
+
+        assert_eq!(metadata.name.as_deref(), Some("bounded-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("Bounded"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_keeps_indented_delimiter_in_block_scalar() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: block-skill\ndescription: |\n  before\n  ---\n  after\n---\nBody\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert_eq!(metadata.name.as_deref(), Some("block-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("before\n---\nafter"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_enforces_exact_byte_limit_boundary() {
+        fn manifest_with_size(size: usize) -> Vec<u8> {
+            let prefix = b"---\nname: boundary-skill\ndescription: ";
+            let suffix = b"\n---\n";
+            assert!(size >= prefix.len() + suffix.len());
+            let mut contents = Vec::with_capacity(size);
+            contents.extend_from_slice(prefix);
+            contents.extend(std::iter::repeat_n(
+                b'x',
+                size - prefix.len() - suffix.len(),
+            ));
+            contents.extend_from_slice(suffix);
+            assert_eq!(contents.len(), size);
+            contents
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let exact = temp.path().join("exact.md");
+        let oversized = temp.path().join("oversized.md");
+        fs::write(&exact, manifest_with_size(MAX_SKILL_FRONTMATTER_BYTES))
+            .expect("write exact-boundary manifest");
+        fs::write(
+            &oversized,
+            manifest_with_size(MAX_SKILL_FRONTMATTER_BYTES + 1),
+        )
+        .expect("write oversized manifest");
+
+        let exact_metadata =
+            SkillService::parse_skill_metadata_static(&exact).expect("parse exact boundary");
+        let oversized_metadata =
+            SkillService::parse_skill_metadata_static(&oversized).expect("parse oversized");
+
+        assert_eq!(exact_metadata.name.as_deref(), Some("boundary-skill"));
+        assert!(oversized_metadata.name.is_none());
     }
 
     /// CC_SWITCH_TEST_HOME 隔离守卫（serial 测试间互斥由 #[serial] 保证，
@@ -4344,6 +4908,59 @@ mod tests {
                 "must reject: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_install_name_rejects_cross_platform_unsafe_segments() {
+        for valid in [
+            "conventional-skill",
+            "com10",
+            "lpt0",
+            "nulled",
+            "skill.name",
+        ] {
+            assert_eq!(
+                SkillService::sanitize_install_name(valid).as_deref(),
+                Some(valid),
+                "portable name should remain valid: {valid:?}"
+            );
+        }
+
+        for invalid in [
+            "con",
+            "CON.txt",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "COM9.log",
+            "COM¹",
+            "lpt1",
+            "LPT9.txt",
+            "LPT².log",
+            "conin$",
+            "CONOUT$.txt",
+            "clock$",
+            "skill.",
+            "skill:name",
+            "skill*name",
+            "skill?name",
+            "skill\"name",
+            "skill<name",
+            "skill>name",
+            "skill|name",
+            "control\u{1f}name",
+        ] {
+            assert!(
+                SkillService::sanitize_install_name(invalid).is_none(),
+                "must reject a name that cannot round-trip across desktop filesystems: {invalid:?}"
+            );
+        }
+
+        assert!(
+            SkillService::sanitize_install_name(&"a".repeat(256)).is_none(),
+            "a segment longer than the common 255-byte limit must be rejected"
+        );
     }
 
     #[test]
@@ -4645,6 +5262,252 @@ mod tests {
             .expect("install name should fall back to the matching discovered skill directory");
 
         assert_eq!(resolved, nested);
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_falls_back_to_unique_metadata_name() {
+        // skills.sh may return the frontmatter name as skillId even when the repository
+        // directory uses a generic name, as in tencent/wechatreading: skills/SKILL.md
+        // declares `name: weread-skills`.
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("skills");
+        write_skill(&source, "weread-skills");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "weread-skills")
+            .expect("a unique frontmatter name should resolve the real source directory");
+
+        assert_eq!(resolved, source);
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_rejects_duplicate_metadata_names() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("skills-a"), "duplicate-skill");
+        write_skill(&temp.path().join("skills-b"), "duplicate-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "duplicate-skill");
+
+        assert!(
+            resolved.is_none(),
+            "ambiguous frontmatter names must not select an arbitrary source: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_rejects_duplicate_directory_names() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("catalog-a/duplicate-skill"), "first");
+        write_skill(&temp.path().join("catalog-b/duplicate-skill"), "second");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "duplicate-skill");
+
+        assert!(
+            resolved.is_none(),
+            "duplicate basenames must not depend on read_dir ordering: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_finds_metadata_name_beyond_four_levels() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("a/b/c/d/e");
+        write_skill(&source, "deep-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "deep-skill")
+            .expect("metadata lookup must not depend on an arbitrary directory depth");
+
+        assert_eq!(resolved, source);
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_finds_metadata_under_hidden_parent() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join(".catalog/skills");
+        write_skill(&source, "hidden-parent-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "hidden-parent-skill")
+            .expect("dot-prefixed catalog directories must not be platform-dependent");
+
+        assert_eq!(resolved, source);
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_requires_exact_skill_md_casing() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("skills");
+        fs::create_dir_all(&source).expect("create skill dir");
+        fs::write(
+            source.join("skill.md"),
+            "---\nname: wrong-case-skill\ndescription: Wrong case\n---\n",
+        )
+        .expect("write lowercase manifest");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "wrong-case-skill");
+
+        assert!(
+            resolved.is_none(),
+            "the Agent Skills spec requires the exact filename SKILL.md on every filesystem"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_skill_source_dir_does_not_follow_symlink_directory_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("skills");
+        write_skill(&source, "cycle-safe-skill");
+        symlink(temp.path(), temp.path().join("loop")).expect("create directory symlink cycle");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "cycle-safe-skill")
+            .expect("a symlink cycle must be skipped without hiding the valid Skill");
+
+        assert_eq!(resolved, source);
+    }
+
+    #[test]
+    fn find_skill_source_candidates_rejects_partial_scan_at_budget_limit() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("a-match"), "budget-skill");
+        fs::create_dir_all(temp.path().join("z-unscanned")).expect("create extra directory");
+
+        // root + a-match consumes the two-directory budget. Returning the match before
+        // proving z-unscanned contains no duplicate would make uniqueness traversal-order based.
+        let candidates = SkillService::find_skill_source_candidates(temp.path(), "budget-skill", 2);
+
+        assert!(
+            candidates.is_none(),
+            "an incomplete bounded scan must fail closed even after seeing a candidate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_skill_source_candidates_rejects_unreadable_subtree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("a-match"), "permission-skill");
+        let unreadable = temp.path().join("z-unreadable");
+        fs::create_dir_all(&unreadable).expect("create unreadable directory");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("remove directory permissions");
+
+        let candidates = SkillService::find_skill_source_candidates(
+            temp.path(),
+            "permission-skill",
+            MAX_SKILL_SCAN_DIRECTORIES,
+        );
+
+        // Restore permissions before tempfile cleanup, even when the assertion below fails.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
+            .expect("restore directory permissions");
+        assert!(
+            candidates.is_none(),
+            "an unreadable subtree could hide a duplicate and must invalidate uniqueness"
+        );
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_rejects_duplicate_metadata_beyond_four_levels() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(&temp.path().join("shallow"), "duplicate-skill");
+        write_skill(&temp.path().join("a/b/c/d/e"), "duplicate-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "duplicate-skill");
+
+        assert!(
+            resolved.is_none(),
+            "a deeper duplicate must participate in uniqueness checks: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_counts_repo_root_in_metadata_uniqueness() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(temp.path(), "duplicate-skill");
+        write_skill(&temp.path().join("nested"), "duplicate-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "duplicate-skill");
+
+        assert!(
+            resolved.is_none(),
+            "root and nested metadata matches must be treated as ambiguous: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_skips_unrelated_invalid_utf8_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("skills");
+        write_skill(&source, "valid-skill");
+
+        let broken = temp.path().join("broken");
+        fs::create_dir_all(&broken).expect("create broken skill dir");
+        fs::write(broken.join("SKILL.md"), [0xff, 0xfe]).expect("write invalid UTF-8");
+
+        let resolved = SkillService::resolve_skill_source_dir(temp.path(), "valid-skill")
+            .expect("an unrelated malformed Skill must not hide a valid unique match");
+
+        assert_eq!(resolved, source);
+    }
+
+    #[test]
+    fn find_remote_skill_by_install_name_falls_back_to_metadata_name() {
+        let remote_skills = vec![discoverable_skill("skills", "weread-skills")];
+
+        let matched =
+            SkillService::find_remote_skill_by_install_name(&remote_skills, "weread-skills")
+                .expect("update matching must understand metadata-derived install names");
+
+        assert_eq!(matched.directory, "skills");
+    }
+
+    #[test]
+    fn find_remote_skill_by_install_name_rejects_duplicate_metadata_names() {
+        let remote_skills = vec![
+            discoverable_skill("skills-a", "duplicate-skill"),
+            discoverable_skill("skills-b", "duplicate-skill"),
+        ];
+
+        let matched =
+            SkillService::find_remote_skill_by_install_name(&remote_skills, "duplicate-skill");
+
+        assert!(
+            matched.is_none(),
+            "updates must not select an arbitrary metadata duplicate"
+        );
+    }
+
+    #[test]
+    fn find_remote_skill_by_install_name_prefers_unique_directory_match() {
+        let remote_skills = vec![
+            discoverable_skill("catalog/target-skill", "directory-match"),
+            discoverable_skill("skills", "target-skill"),
+        ];
+
+        let matched =
+            SkillService::find_remote_skill_by_install_name(&remote_skills, "target-skill")
+                .expect("a unique basename must retain priority over metadata fallback");
+
+        assert_eq!(matched.directory, "catalog/target-skill");
+    }
+
+    #[test]
+    fn find_remote_skill_by_install_name_rejects_duplicate_directory_names() {
+        let remote_skills = vec![
+            discoverable_skill("catalog-a/duplicate-skill", "first"),
+            discoverable_skill("catalog-b/duplicate-skill", "second"),
+        ];
+
+        let matched =
+            SkillService::find_remote_skill_by_install_name(&remote_skills, "duplicate-skill");
+
+        assert!(
+            matched.is_none(),
+            "updates must not select an arbitrary directory duplicate"
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ function getErrorI18nKey(code: string): string {
     INVALID_REPO_REF: "skills.error.invalidRepoRef",
     ARCHIVE_TOO_LARGE: "skills.error.archiveTooLarge",
     ARCHIVE_TOO_MANY_ENTRIES: "skills.error.archiveTooManyEntries",
+    ARCHIVE_PATH_COLLISION: "skills.error.archivePathCollision",
     GET_HOME_DIR_FAILED: "skills.error.getHomeDirFailed",
     NO_SKILLS_IN_ZIP: "skills.error.noSkillsInZip",
   };

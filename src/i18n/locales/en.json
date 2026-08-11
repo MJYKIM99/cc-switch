@@ -2320,6 +2320,7 @@
       "invalidRepoRef": "Invalid repository reference: {{owner}}/{{name}}",
       "archiveTooLarge": "Archive exceeds the {{limit_mb}} MB extraction limit; aborted",
       "archiveTooManyEntries": "Archive has too many entries ({{count}}); the limit is {{limit}}",
+      "archivePathCollision": "Archive paths '{{path}}' and '{{existing_path}}' collide on some filesystems",
       "downloadFailed": "Download failed: HTTP {{status}}",
       "allBranchesFailed": "All branches failed, tried: {{branches}}",
       "httpError": "HTTP error {{status}}",
