@@ -123,7 +123,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install Linux system deps
-        if: runner.os == 'Linux'
+        # GitHub-hosted images install these at runtime. The GCP runner image
+        # already contains them and cannot elevate under Cloud Run's no-new-privileges policy.
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
