@@ -136,11 +136,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsoup-3.0-dev \
             || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
 
-      - name: Limit Cargo parallelism on GCP
-        # The scale-to-zero pool is 2 CPU / 8 GiB. One Cargo job keeps
-        # Tauri dependency compilation below its memory limit on cold builds.
+      - name: Configure Cargo for GCP
+        # Bound compiler concurrency on the 2 CPU / 8 GiB pool. CI tests do
+        # not need debug symbols; omitting them keeps the final cc-switch
+        # test build below the memory limit without changing test assertions.
         if: runner.os == 'Linux' && runner.environment == 'self-hosted'
-        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
+        run: |
+          echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
 
       - name: Cache Cargo registry and build
         uses: actions/cache@v5
