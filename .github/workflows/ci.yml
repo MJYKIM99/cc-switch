@@ -137,9 +137,10 @@ jobs:
             || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
 
       - name: Configure Cargo for GCP
-        # Bound compiler concurrency on the 2 CPU / 8 GiB pool. CI tests do
-        # not need debug symbols; omitting them keeps the final cc-switch
-        # test build below the memory limit without changing test assertions.
+        # Bound compiler concurrency on the 4 CPU / 16 GiB pool. Cargo build
+        # artifacts also consume Cloud Run instance memory. CI tests do not
+        # need debug symbols; omitting them preserves headroom without changing
+        # test assertions.
         if: runner.os == 'Linux' && runner.environment == 'self-hosted'
         run: |
           echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
