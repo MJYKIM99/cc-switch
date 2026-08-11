@@ -136,6 +136,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsoup-3.0-dev \
             || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
 
+      - name: Limit Cargo parallelism on GCP
+        # The scale-to-zero standard pool is 2 CPU / 4 GiB. One Cargo job keeps
+        # Tauri dependency compilation below its memory limit on cold builds.
+        if: runner.os == 'Linux' && runner.environment == 'self-hosted'
+        run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
+
       - name: Cache Cargo registry and build
         uses: actions/cache@v5
         with:
