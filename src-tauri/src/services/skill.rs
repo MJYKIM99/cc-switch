@@ -300,6 +300,16 @@ pub struct SkillMetadata {
     pub description: Option<String>,
 }
 
+/// 一次完整仓库扫描得到的 Skill 源目录索引。
+///
+/// key 沿用现有 ASCII 大小写不敏感语义；value 保留所有候选，调用方只有在候选
+/// 唯一时才可解析，避免依赖文件系统遍历顺序。
+#[derive(Debug, Default)]
+struct SkillSourceIndex {
+    directory_matches: HashMap<String, Vec<PathBuf>>,
+    metadata_matches: HashMap<String, Vec<PathBuf>>,
+}
+
 /// 导入已有 Skill 时，前端显式提交的启用应用选择
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1014,6 +1024,7 @@ impl SkillService {
                 }
             };
             let temp_dir = temp_guard.path();
+            let source_index = Self::build_skill_source_index(temp_dir, MAX_SKILL_SCAN_DIRECTORIES);
 
             for skill in group_skills {
                 // 安装目录可能来自 frontmatter name。直接复用安装时的全树解析器；
@@ -1022,6 +1033,7 @@ impl SkillService {
                     temp_dir,
                     &skill.directory,
                     name,
+                    source_index.as_ref(),
                 ) {
                     Some(path) => path,
                     None => continue,
@@ -1126,21 +1138,26 @@ impl SkillService {
             ))
         })??;
         let temp_dir = temp_guard.path();
+        let source_index = Self::build_skill_source_index(temp_dir, MAX_SKILL_SCAN_DIRECTORIES);
 
         // 与安装和更新检查使用同一个全树解析器，避免父 Skill 截断 discovery 扫描后
         // 误报嵌套 Skill 不存在。
-        let source =
-            match Self::resolve_skill_source_dir_for_update(temp_dir, &skill.directory, &name) {
-                Some(source) => source,
-                None => {
-                    let missing = temp_dir.join(&skill.directory).display().to_string();
-                    return Err(anyhow!(format_skill_error(
-                        "SKILL_DIR_NOT_FOUND",
-                        &[("path", &missing)],
-                        Some("checkRepoUrl"),
-                    )));
-                }
-            };
+        let source = match Self::resolve_skill_source_dir_for_update(
+            temp_dir,
+            &skill.directory,
+            &name,
+            source_index.as_ref(),
+        ) {
+            Some(source) => source,
+            None => {
+                let missing = temp_dir.join(&skill.directory).display().to_string();
+                return Err(anyhow!(format_skill_error(
+                    "SKILL_DIR_NOT_FOUND",
+                    &[("path", &missing)],
+                    Some("checkRepoUrl"),
+                )));
+            }
+        };
 
         // 下载和扫描期间用户可能已经卸载了该 Skill。必须在任何备份、删除或
         // 复制之前重新确认记录仍存在；否则即使最终的 metadata UPDATE 能发现
@@ -2421,20 +2438,15 @@ impl SkillService {
         Ok(())
     }
 
-    /// 扫描仓库中的 Skill 目录，同时收集目录 basename 与 frontmatter name 候选。
+    /// 扫描一次仓库，按目录 basename 与 frontmatter name 建立候选索引。
     ///
     /// 不使用固定深度：合法 Skill 可以位于任意深度；改用目录数量预算限制工作量。
     /// 迭代遍历避免深目录耗尽调用栈，`DirEntry::file_type` 则确保不跟随 symlink。
     /// 返回 None 表示目录树无法被完整、可信地扫描，此时调用方必须拒绝猜测。
-    fn find_skill_source_candidates(
-        root: &Path,
-        target_name: &str,
-        max_directories: usize,
-    ) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    fn build_skill_source_index(root: &Path, max_directories: usize) -> Option<SkillSourceIndex> {
         let mut pending = vec![root.to_path_buf()];
         let mut scanned_directories = 0usize;
-        let mut directory_matches = Vec::new();
-        let mut metadata_matches = Vec::new();
+        let mut index = SkillSourceIndex::default();
 
         while let Some(dir) = pending.pop() {
             scanned_directories += 1;
@@ -2445,22 +2457,27 @@ impl SkillService {
 
             let skill_md = dir.join("SKILL.md");
             if skill_md.is_file() {
-                if dir != root
-                    && dir.file_name().is_some_and(|name| {
-                        name.to_string_lossy().eq_ignore_ascii_case(target_name)
-                    })
-                {
-                    directory_matches.push(dir.clone());
+                if dir != root {
+                    if let Some(name) = dir.file_name() {
+                        index
+                            .directory_matches
+                            .entry(name.to_string_lossy().to_ascii_lowercase())
+                            .or_default()
+                            .push(dir.clone());
+                    }
                 }
 
                 match Self::parse_skill_metadata_static(&skill_md) {
                     Ok(metadata) => {
-                        if metadata
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| name.trim().eq_ignore_ascii_case(target_name))
-                        {
-                            metadata_matches.push(dir.clone());
+                        if let Some(name) = metadata.name {
+                            let key = name.trim().to_ascii_lowercase();
+                            if !key.is_empty() {
+                                index
+                                    .metadata_matches
+                                    .entry(key)
+                                    .or_default()
+                                    .push(dir.clone());
+                            }
                         }
                     }
                     Err(error)
@@ -2529,34 +2546,39 @@ impl SkillService {
             pending.extend(children.into_iter().rev());
         }
 
-        Some((directory_matches, metadata_matches))
+        Some(index)
     }
 
-    /// 将 discoverable skill 的目录信息重新解析为解压目录中的真实源目录。
-    ///
-    /// **核心原则：返回的目录必定含 `SKILL.md`**（以 SKILL.md 为锚点）。解析顺序：
-    /// 1. 直接相对路径命中（如 `skills/foo`），校验含 `SKILL.md`——明确路径优先；
-    /// 2. 按安装名递归查找名字匹配 **且** 含 `SKILL.md` 的目录；
-    /// 3. 按 SKILL.md frontmatter `name` 唯一匹配目录；
-    /// 4. 兜底：仓库根本身含 `SKILL.md`。
-    fn resolve_skill_source_dir(root: &Path, raw_directory: &str) -> Option<PathBuf> {
+    /// 解析并优先验证调用方提供的明确相对路径。返回安装名以及可能的直接命中，
+    /// 让安装与批量更新可以共享后续的索引解析逻辑。
+    fn prepare_skill_source_lookup(
+        root: &Path,
+        raw_directory: &str,
+    ) -> Option<(String, Option<PathBuf>)> {
         let source_rel = Self::sanitize_skill_source_path(raw_directory)?;
-        let install_name = source_rel
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())?;
-
-        // 1. 直接相对路径命中（明确路径优先）——必须校验 SKILL.md，否则同名空壳目录
-        //    （如 ast-grep/agent-skill 根下的 plugin 包目录 ast-grep/）会被误判为源目录。
+        let install_name = source_rel.file_name()?.to_string_lossy().into_owned();
         let direct = root.join(&source_rel);
-        if direct.is_dir() && direct.join("SKILL.md").is_file() {
-            return Some(direct);
-        }
+        let direct = (direct.is_dir() && direct.join("SKILL.md").is_file()).then_some(direct);
 
-        let (directory_matches, metadata_matches) =
-            Self::find_skill_source_candidates(root, &install_name, MAX_SKILL_SCAN_DIRECTORIES)?;
+        Some((install_name, direct))
+    }
 
-        // 2. 按名字递归查找。只接受唯一候选，避免 read_dir 的平台相关顺序决定结果。
-        match directory_matches.as_slice() {
+    /// 使用一次完整扫描得到的索引解析非直接路径。只有唯一候选才可命中，避免
+    /// read_dir 顺序或部分扫描决定安装结果。
+    fn resolve_indexed_skill_source(
+        root: &Path,
+        install_name: &str,
+        index: &SkillSourceIndex,
+    ) -> Option<PathBuf> {
+        let lookup_key = install_name.to_ascii_lowercase();
+        let directory_matches = index
+            .directory_matches
+            .get(&lookup_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        // 按名字递归查找。只接受唯一候选，避免 read_dir 的平台相关顺序决定结果。
+        match directory_matches {
             [found] => {
                 log::info!(
                     "Skill directory '{}' not found at direct path, using fallback: {}",
@@ -2575,9 +2597,14 @@ impl SkillService {
             }
         }
 
-        // 3. skills.sh 的 skillId 可能来自 frontmatter name，与实际目录名不同。
-        //    根目录也参与唯一性检查，避免根 Skill 被同名子目录意外替换。
-        match metadata_matches.as_slice() {
+        // skills.sh 的 skillId 可能来自 frontmatter name，与实际目录名不同。
+        // 根目录也参与唯一性检查，避免根 Skill 被同名子目录意外替换。
+        let metadata_matches = index
+            .metadata_matches
+            .get(&lookup_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        match metadata_matches {
             [found] => {
                 log::info!(
                     "Skill directory '{}' not found by path or directory name, using metadata fallback: {}",
@@ -2596,7 +2623,8 @@ impl SkillService {
             }
         }
 
-        // 4. 兜底：仓库根本身是 skill
+        // 仓库根本身是 Skill 时保留安装流程的既有兜底；更新流程会再校验根 Skill
+        // 是否确实对应已安装项，避免嵌套 Skill 被删除后误替换。
         if root.join("SKILL.md").is_file() {
             log::info!(
                 "Skill directory '{}' not found, but SKILL.md exists at root, using repo root",
@@ -2608,6 +2636,38 @@ impl SkillService {
         None
     }
 
+    /// 使用调用方提供的仓库索引解析 Skill。批量更新为同一仓库建立一次索引后，
+    /// 所有已安装项都走这里，避免对同一目录树重复遍历和解析 frontmatter。
+    fn resolve_skill_source_dir_with_index(
+        root: &Path,
+        raw_directory: &str,
+        index: Option<&SkillSourceIndex>,
+    ) -> Option<PathBuf> {
+        let (install_name, direct) = Self::prepare_skill_source_lookup(root, raw_directory)?;
+        if let Some(direct) = direct {
+            return Some(direct);
+        }
+
+        Self::resolve_indexed_skill_source(root, &install_name, index?)
+    }
+
+    /// 将 discoverable skill 的目录信息重新解析为解压目录中的真实源目录。
+    ///
+    /// **核心原则：返回的目录必定含 `SKILL.md`**（以 SKILL.md 为锚点）。解析顺序：
+    /// 1. 直接相对路径命中（如 `skills/foo`），校验含 `SKILL.md`——明确路径优先；
+    /// 2. 按安装名递归查找名字匹配 **且** 含 `SKILL.md` 的目录；
+    /// 3. 按 SKILL.md frontmatter `name` 唯一匹配目录；
+    /// 4. 兜底：仓库根本身含 `SKILL.md`。
+    fn resolve_skill_source_dir(root: &Path, raw_directory: &str) -> Option<PathBuf> {
+        let (install_name, direct) = Self::prepare_skill_source_lookup(root, raw_directory)?;
+        if let Some(direct) = direct {
+            return Some(direct);
+        }
+
+        let index = Self::build_skill_source_index(root, MAX_SKILL_SCAN_DIRECTORIES)?;
+        Self::resolve_indexed_skill_source(root, &install_name, &index)
+    }
+
     /// 更新路径使用安装时的全树解析，但不能无条件沿用“仓库根就是唯一 Skill”的兜底。
     /// 嵌套 Skill 被删除时，仓库根可能仍是另一个 Skill；只有安装名与仓库名或根
     /// frontmatter name 一致时，才允许用根目录作为更新源。
@@ -2615,8 +2675,9 @@ impl SkillService {
         root: &Path,
         raw_directory: &str,
         repo_name: &str,
+        index: Option<&SkillSourceIndex>,
     ) -> Option<PathBuf> {
-        let source = Self::resolve_skill_source_dir(root, raw_directory)?;
+        let source = Self::resolve_skill_source_dir_with_index(root, raw_directory, index)?;
         if source != root {
             return Some(source);
         }
@@ -2629,12 +2690,12 @@ impl SkillService {
             return Some(source);
         }
 
-        let root_name = Self::parse_skill_metadata_static(&root.join("SKILL.md"))
-            .ok()?
-            .name?;
-        root_name
-            .trim()
-            .eq_ignore_ascii_case(&install_name)
+        let lookup_key = install_name.to_ascii_lowercase();
+        index?
+            .metadata_matches
+            .get(&lookup_key)?
+            .iter()
+            .any(|candidate| candidate == root)
             .then_some(source)
     }
 
@@ -4974,11 +5035,13 @@ mod tests {
         write_skill(temp.path(), "parent-skill");
         let nested = temp.path().join("catalog/generic-child");
         write_skill(&nested, "nested-update-skill");
+        let index = SkillService::build_skill_source_index(temp.path(), MAX_SKILL_SCAN_DIRECTORIES);
 
         let resolved = SkillService::resolve_skill_source_dir_for_update(
             temp.path(),
             "nested-update-skill",
             "repository-name",
+            index.as_ref(),
         )
         .expect("update lookup must scan below a parent directory that is also a Skill");
 
@@ -4989,17 +5052,44 @@ mod tests {
     fn resolve_skill_source_dir_for_update_does_not_substitute_unrelated_root_skill() {
         let temp = tempdir().expect("tempdir");
         write_skill(temp.path(), "parent-skill");
+        let index = SkillService::build_skill_source_index(temp.path(), MAX_SKILL_SCAN_DIRECTORIES);
 
         let resolved = SkillService::resolve_skill_source_dir_for_update(
             temp.path(),
             "removed-nested-skill",
             "repository-name",
+            index.as_ref(),
         );
 
         assert!(
             resolved.is_none(),
             "a removed nested Skill must not be replaced with an unrelated repository-root Skill"
         );
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_for_update_allows_matching_root_skill() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(temp.path(), "root-metadata-name");
+        let index = SkillService::build_skill_source_index(temp.path(), MAX_SKILL_SCAN_DIRECTORIES);
+
+        for (directory, repo_name) in [
+            ("repository-name", "repository-name"),
+            ("root-metadata-name", "repository-name"),
+        ] {
+            let resolved = SkillService::resolve_skill_source_dir_for_update(
+                temp.path(),
+                directory,
+                repo_name,
+                index.as_ref(),
+            );
+
+            assert_eq!(
+                resolved.as_deref(),
+                Some(temp.path()),
+                "a root Skill matching the repository or metadata name should remain updateable"
+            );
+        }
     }
 
     #[test]
@@ -5071,24 +5161,24 @@ mod tests {
     }
 
     #[test]
-    fn find_skill_source_candidates_rejects_partial_scan_at_budget_limit() {
+    fn build_skill_source_index_rejects_partial_scan_at_budget_limit() {
         let temp = tempdir().expect("tempdir");
         write_skill(&temp.path().join("a-match"), "budget-skill");
         fs::create_dir_all(temp.path().join("z-unscanned")).expect("create extra directory");
 
         // root + a-match consumes the two-directory budget. Returning the match before
         // proving z-unscanned contains no duplicate would make uniqueness traversal-order based.
-        let candidates = SkillService::find_skill_source_candidates(temp.path(), "budget-skill", 2);
+        let index = SkillService::build_skill_source_index(temp.path(), 2);
 
         assert!(
-            candidates.is_none(),
+            index.is_none(),
             "an incomplete bounded scan must fail closed even after seeing a candidate"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn find_skill_source_candidates_rejects_unreadable_subtree() {
+    fn build_skill_source_index_rejects_unreadable_subtree() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempdir().expect("tempdir");
@@ -5098,17 +5188,13 @@ mod tests {
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
             .expect("remove directory permissions");
 
-        let candidates = SkillService::find_skill_source_candidates(
-            temp.path(),
-            "permission-skill",
-            MAX_SKILL_SCAN_DIRECTORIES,
-        );
+        let index = SkillService::build_skill_source_index(temp.path(), MAX_SKILL_SCAN_DIRECTORIES);
 
         // Restore permissions before tempfile cleanup, even when the assertion below fails.
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700))
             .expect("restore directory permissions");
         assert!(
-            candidates.is_none(),
+            index.is_none(),
             "an unreadable subtree could hide a duplicate and must invalidate uniqueness"
         );
     }
