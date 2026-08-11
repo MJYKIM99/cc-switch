@@ -10,10 +10,15 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   changes:
     name: Detect changed areas
-    runs-on: ubuntu-latest
+    # This public fork uses GCP only for trusted pushes. External PR code stays
+    # on GitHub-hosted runners and never reaches the shared self-hosted pool.
+    runs-on: ${{ github.event_name == 'push' && github.repository == 'MJYKIM99/cc-switch' && 'gcp-linux-standard' || 'ubuntu-latest' }}
     permissions:
       contents: read
       pull-requests: read
@@ -54,7 +59,7 @@ jobs:
 
   frontend:
     name: Frontend Checks
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'push' && github.repository == 'MJYKIM99/cc-switch' && 'gcp-linux-standard' || 'ubuntu-latest' }}
     needs: changes
     # Pushes to main always run everything: they keep the caches that PRs restore from warm.
     if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true'
@@ -101,7 +106,7 @@ jobs:
 
   backend:
     name: Backend Checks
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ github.event_name == 'push' && github.repository == 'MJYKIM99/cc-switch' && matrix.os == 'ubuntu-22.04' && 'gcp-linux-standard' || matrix.os }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
     strategy:
@@ -157,7 +162,9 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
+    # Keep the upstream-only WSL contract out of this fork: windows-2025
+    # currently relinks after TEMP moves to a WSL UNC path and mt.exe fails.
+    if: github.repository != 'MJYKIM99/cc-switch' && (github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true')
     permissions:
       contents: read
     steps:
