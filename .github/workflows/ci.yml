@@ -137,7 +137,7 @@ jobs:
             || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
 
       - name: Limit Cargo parallelism on GCP
-        # The scale-to-zero standard pool is 2 CPU / 4 GiB. One Cargo job keeps
+        # The scale-to-zero pool is 2 CPU / 8 GiB. One Cargo job keeps
         # Tauri dependency compilation below its memory limit on cold builds.
         if: runner.os == 'Linux' && runner.environment == 'self-hosted'
         run: echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
@@ -159,8 +159,22 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
 
-      - name: Clippy
+      - name: Clippy (GitHub-hosted)
+        if: runner.environment == 'github-hosted'
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Clippy (GCP)
+        # Cloud Run's writable filesystem counts toward the instance memory.
+        # Keep Clippy's cold-build artifacts separate so they can be released
+        # before cargo test creates a second set of Tauri build artifacts.
+        if: runner.os == 'Linux' && runner.environment == 'self-hosted'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cc-switch-clippy-target
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Release GCP Clippy build space
+        if: runner.os == 'Linux' && runner.environment == 'self-hosted'
+        run: cargo clean --target-dir "$RUNNER_TEMP/cc-switch-clippy-target"
 
       - name: Run tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
