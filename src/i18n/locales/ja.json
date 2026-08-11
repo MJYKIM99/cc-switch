@@ -2320,6 +2320,7 @@
       "invalidRepoRef": "リポジトリの指定が不正です：{{owner}}/{{name}}",
       "archiveTooLarge": "アーカイブが展開上限 {{limit_mb}} MB を超えたため中止しました",
       "archiveTooManyEntries": "アーカイブのエントリ数が多すぎます（{{count}}）。上限は {{limit}} です",
+      "archivePathCollision": "アーカイブ内のパス '{{path}}' と '{{existing_path}}' は一部のファイルシステムで競合します",
       "downloadFailed": "ダウンロードに失敗しました: HTTP {{status}}",
       "allBranchesFailed": "すべてのブランチで失敗しました。試行: {{branches}}",
       "httpError": "HTTP エラー {{status}}",

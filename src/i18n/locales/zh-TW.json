@@ -2321,6 +2321,7 @@
       "invalidRepoRef": "倉庫位址不合法：{{owner}}/{{name}}",
       "archiveTooLarge": "壓縮檔解壓後超過 {{limit_mb}} MB 上限，已中止",
       "archiveTooManyEntries": "壓縮檔項目過多（{{count}}），上限 {{limit}}",
+      "archivePathCollision": "壓縮檔路徑 '{{path}}' 與 '{{existing_path}}' 在部分檔案系統上衝突",
       "downloadFailed": "下載失敗：HTTP {{status}}",
       "allBranchesFailed": "所有分支下載失敗，嘗試了：{{branches}}",
       "httpError": "HTTP 錯誤 {{status}}",

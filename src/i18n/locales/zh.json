@@ -2320,6 +2320,7 @@
       "invalidRepoRef": "仓库地址不合法：{{owner}}/{{name}}",
       "archiveTooLarge": "压缩包解压后超过 {{limit_mb}} MB 上限，已中止",
       "archiveTooManyEntries": "压缩包条目过多（{{count}}），上限 {{limit}}",
+      "archivePathCollision": "压缩包路径 '{{path}}' 与 '{{existing_path}}' 在部分文件系统上冲突",
       "downloadFailed": "下载失败：HTTP {{status}}",
       "allBranchesFailed": "所有分支下载失败，尝试了：{{branches}}",
       "httpError": "HTTP 错误 {{status}}",
