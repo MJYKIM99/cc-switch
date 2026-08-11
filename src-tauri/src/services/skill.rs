@@ -1015,21 +1015,15 @@ impl SkillService {
             };
             let temp_dir = temp_guard.path();
 
-            // 扫描仓库中的所有 Skill 目录
-            let mut remote_skills: Vec<DiscoverableSkill> = Vec::new();
-            let _ = self.scan_dir_recursive(temp_dir, temp_dir, &repo, &mut remote_skills);
-
             for skill in group_skills {
-                // 在远程仓库中找到匹配的 Skill。安装目录保存的是 skills.sh skillId，
-                // 它可能来自 frontmatter name，并不一定等于仓库目录 basename。
-                let remote_match =
-                    Self::find_remote_skill_by_install_name(&remote_skills, &skill.directory);
-
-                let remote_skill_dir = match remote_match {
-                    Some(rs) => match Self::resolve_skill_source_dir(temp_dir, &rs.directory) {
-                        Some(path) => path,
-                        None => continue,
-                    },
+                // 安装目录可能来自 frontmatter name。直接复用安装时的全树解析器；
+                // discovery 扫描会在父 Skill 处停止，不能作为嵌套 Skill 的前置过滤器。
+                let remote_skill_dir = match Self::resolve_skill_source_dir_for_update(
+                    temp_dir,
+                    &skill.directory,
+                    name,
+                ) {
+                    Some(path) => path,
                     None => continue,
                 };
 
@@ -1133,30 +1127,20 @@ impl SkillService {
         })??;
         let temp_dir = temp_guard.path();
 
-        // 在解压的仓库中查找 Skill 源目录
-        let mut remote_skills: Vec<DiscoverableSkill> = Vec::new();
-        let _ = self.scan_dir_recursive(temp_dir, temp_dir, &repo, &mut remote_skills);
-
-        let remote_match =
-            Self::find_remote_skill_by_install_name(&remote_skills, &skill.directory).ok_or_else(
-                || {
-                    anyhow!(format_skill_error(
-                        "SKILL_DIR_NOT_FOUND",
-                        &[("path", &skill.directory)],
-                        Some("checkRepoUrl"),
-                    ))
-                },
-            )?;
-
+        // 与安装和更新检查使用同一个全树解析器，避免父 Skill 截断 discovery 扫描后
+        // 误报嵌套 Skill 不存在。
         let source =
-            Self::resolve_skill_source_dir(temp_dir, &remote_match.directory).ok_or_else(|| {
-                let missing = temp_dir.join(&remote_match.directory).display().to_string();
-                anyhow!(format_skill_error(
-                    "SKILL_DIR_NOT_FOUND",
-                    &[("path", &missing)],
-                    Some("checkRepoUrl"),
-                ))
-            })?;
+            match Self::resolve_skill_source_dir_for_update(temp_dir, &skill.directory, &name) {
+                Some(source) => source,
+                None => {
+                    let missing = temp_dir.join(&skill.directory).display().to_string();
+                    return Err(anyhow!(format_skill_error(
+                        "SKILL_DIR_NOT_FOUND",
+                        &[("path", &missing)],
+                        Some("checkRepoUrl"),
+                    )));
+                }
+            };
 
         // 下载和扫描期间用户可能已经卸载了该 Skill。必须在任何备份、删除或
         // 复制之前重新确认记录仍存在；否则即使最终的 metadata UPDATE 能发现
@@ -2548,52 +2532,6 @@ impl SkillService {
         Some((directory_matches, metadata_matches))
     }
 
-    /// 以安装目录名匹配远端扫描结果。目录 basename 保持最高优先级；只有它没有
-    /// 命中时才按 frontmatter 显示名回退。两个层级都只接受唯一候选。
-    fn find_remote_skill_by_install_name<'a>(
-        remote_skills: &'a [DiscoverableSkill],
-        install_name: &str,
-    ) -> Option<&'a DiscoverableSkill> {
-        let directory_matches: Vec<_> = remote_skills
-            .iter()
-            .filter(|skill| {
-                skill
-                    .directory
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&skill.directory)
-                    .eq_ignore_ascii_case(install_name)
-            })
-            .collect();
-        match directory_matches.as_slice() {
-            [matched] => return Some(*matched),
-            [] => {}
-            _ => {
-                log::warn!(
-                    "Multiple remote Skill directories match install name '{}'; refusing an arbitrary update",
-                    install_name
-                );
-                return None;
-            }
-        }
-
-        let metadata_matches: Vec<_> = remote_skills
-            .iter()
-            .filter(|skill| skill.name.trim().eq_ignore_ascii_case(install_name))
-            .collect();
-        match metadata_matches.as_slice() {
-            [matched] => Some(*matched),
-            [] => None,
-            _ => {
-                log::warn!(
-                    "Multiple remote Skills declare metadata name '{}'; refusing an arbitrary update",
-                    install_name
-                );
-                None
-            }
-        }
-    }
-
     /// 将 discoverable skill 的目录信息重新解析为解压目录中的真实源目录。
     ///
     /// **核心原则：返回的目录必定含 `SKILL.md`**（以 SKILL.md 为锚点）。解析顺序：
@@ -2668,6 +2606,36 @@ impl SkillService {
         }
 
         None
+    }
+
+    /// 更新路径使用安装时的全树解析，但不能无条件沿用“仓库根就是唯一 Skill”的兜底。
+    /// 嵌套 Skill 被删除时，仓库根可能仍是另一个 Skill；只有安装名与仓库名或根
+    /// frontmatter name 一致时，才允许用根目录作为更新源。
+    fn resolve_skill_source_dir_for_update(
+        root: &Path,
+        raw_directory: &str,
+        repo_name: &str,
+    ) -> Option<PathBuf> {
+        let source = Self::resolve_skill_source_dir(root, raw_directory)?;
+        if source != root {
+            return Some(source);
+        }
+
+        let install_name = Self::sanitize_skill_source_path(raw_directory)?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned();
+        if install_name.eq_ignore_ascii_case(repo_name) {
+            return Some(source);
+        }
+
+        let root_name = Self::parse_skill_metadata_static(&root.join("SKILL.md"))
+            .ok()?
+            .name?;
+        root_name
+            .trim()
+            .eq_ignore_ascii_case(&install_name)
+            .then_some(source)
     }
 
     /// 由真实解析出的源目录推导 SKILL.md 在仓库内的相对文档路径（正斜杠）。
@@ -4423,19 +4391,6 @@ mod tests {
         .expect("write SKILL.md");
     }
 
-    fn discoverable_skill(directory: &str, name: &str) -> DiscoverableSkill {
-        DiscoverableSkill {
-            key: format!("owner/repo:{directory}"),
-            name: name.to_string(),
-            description: String::new(),
-            directory: directory.to_string(),
-            readme_url: None,
-            repo_owner: "owner".to_string(),
-            repo_name: "repo".to_string(),
-            repo_branch: "main".to_string(),
-        }
-    }
-
     #[test]
     fn parse_skill_metadata_static_requires_frontmatter_at_file_start() {
         let temp = tempdir().expect("tempdir");
@@ -5014,6 +4969,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_skill_source_dir_for_update_finds_target_below_parent_skill() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(temp.path(), "parent-skill");
+        let nested = temp.path().join("catalog/generic-child");
+        write_skill(&nested, "nested-update-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir_for_update(
+            temp.path(),
+            "nested-update-skill",
+            "repository-name",
+        )
+        .expect("update lookup must scan below a parent directory that is also a Skill");
+
+        assert_eq!(resolved, nested);
+    }
+
+    #[test]
+    fn resolve_skill_source_dir_for_update_does_not_substitute_unrelated_root_skill() {
+        let temp = tempdir().expect("tempdir");
+        write_skill(temp.path(), "parent-skill");
+
+        let resolved = SkillService::resolve_skill_source_dir_for_update(
+            temp.path(),
+            "removed-nested-skill",
+            "repository-name",
+        );
+
+        assert!(
+            resolved.is_none(),
+            "a removed nested Skill must not be replaced with an unrelated repository-root Skill"
+        );
+    }
+
+    #[test]
     fn resolve_skill_source_dir_rejects_duplicate_metadata_names() {
         let temp = tempdir().expect("tempdir");
         write_skill(&temp.path().join("skills-a"), "duplicate-skill");
@@ -5166,63 +5155,6 @@ mod tests {
             .expect("an unrelated malformed Skill must not hide a valid unique match");
 
         assert_eq!(resolved, source);
-    }
-
-    #[test]
-    fn find_remote_skill_by_install_name_falls_back_to_metadata_name() {
-        let remote_skills = vec![discoverable_skill("skills", "weread-skills")];
-
-        let matched =
-            SkillService::find_remote_skill_by_install_name(&remote_skills, "weread-skills")
-                .expect("update matching must understand metadata-derived install names");
-
-        assert_eq!(matched.directory, "skills");
-    }
-
-    #[test]
-    fn find_remote_skill_by_install_name_rejects_duplicate_metadata_names() {
-        let remote_skills = vec![
-            discoverable_skill("skills-a", "duplicate-skill"),
-            discoverable_skill("skills-b", "duplicate-skill"),
-        ];
-
-        let matched =
-            SkillService::find_remote_skill_by_install_name(&remote_skills, "duplicate-skill");
-
-        assert!(
-            matched.is_none(),
-            "updates must not select an arbitrary metadata duplicate"
-        );
-    }
-
-    #[test]
-    fn find_remote_skill_by_install_name_prefers_unique_directory_match() {
-        let remote_skills = vec![
-            discoverable_skill("catalog/target-skill", "directory-match"),
-            discoverable_skill("skills", "target-skill"),
-        ];
-
-        let matched =
-            SkillService::find_remote_skill_by_install_name(&remote_skills, "target-skill")
-                .expect("a unique basename must retain priority over metadata fallback");
-
-        assert_eq!(matched.directory, "catalog/target-skill");
-    }
-
-    #[test]
-    fn find_remote_skill_by_install_name_rejects_duplicate_directory_names() {
-        let remote_skills = vec![
-            discoverable_skill("catalog-a/duplicate-skill", "first"),
-            discoverable_skill("catalog-b/duplicate-skill", "second"),
-        ];
-
-        let matched =
-            SkillService::find_remote_skill_by_install_name(&remote_skills, "duplicate-skill");
-
-        assert!(
-            matched.is_none(),
-            "updates must not select an arbitrary directory duplicate"
-        );
     }
 
     #[test]
