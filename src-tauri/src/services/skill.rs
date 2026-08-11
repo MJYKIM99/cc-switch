@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -276,6 +277,9 @@ const MAX_ARCHIVE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// 源目录解析允许访问的目录数。远端归档本身最多有 MAX_ARCHIVE_ENTRIES 个条目，
 /// 再加一个解压后的临时根目录；超过这个数量时拒绝继续扫描，避免异常目录树拖垮安装。
 const MAX_SKILL_SCAN_DIRECTORIES: usize = MAX_ARCHIVE_ENTRIES + 1;
+/// YAML frontmatter 应是很短的文件头。只读取到独立结束分隔行并限制总字节数，
+/// 避免为一个超大 SKILL.md 分配数百 MiB 内存。
+const MAX_SKILL_FRONTMATTER_BYTES: usize = 64 * 1024;
 /// symlink 目标就是一条路径，几十字节就够；给到 4 KiB 是宽松上限。
 /// 必须有这个上限：zip 2.4.2 的 `make_reader` 不按声明的 uncompressed_size
 /// 截断读取，所以一个打了 symlink 标志、deflate 流却能膨胀到数 GB 的条目，
@@ -2172,22 +2176,57 @@ impl SkillService {
 
     /// 静态方法：解析技能元数据
     fn parse_skill_metadata_static(path: &Path) -> Result<SkillMetadata> {
-        let content = fs::read_to_string(path)?;
-        let content = content.trim_start_matches('\u{feff}');
-
-        let parts: Vec<&str> = content.splitn(3, "---").collect();
-        if parts.len() < 3 {
-            return Ok(SkillMetadata {
+        fn empty_metadata() -> SkillMetadata {
+            SkillMetadata {
                 name: None,
                 description: None,
-            });
+            }
         }
 
-        let front_matter = parts[1].trim();
-        let meta: SkillMetadata = serde_yaml::from_str(front_matter).unwrap_or(SkillMetadata {
-            name: None,
-            description: None,
-        });
+        fn is_delimiter_line(line: &str) -> bool {
+            line.trim_end_matches(['\r', '\n', ' ', '\t']) == "---"
+        }
+
+        // `Take` 必须包在 BufReader 外层，这样即使首行没有换行，read_line 也最多
+        // 分配 limit + 1 字节。找到结束分隔行后立即停止，不读取 Markdown 正文。
+        let file = fs::File::open(path)?;
+        let mut reader =
+            std::io::BufReader::new(file).take((MAX_SKILL_FRONTMATTER_BYTES + 1) as u64);
+        let mut consumed = 0usize;
+
+        let mut opening_line = String::new();
+        let bytes = reader.read_line(&mut opening_line)?;
+        consumed += bytes;
+        if bytes == 0 || consumed > MAX_SKILL_FRONTMATTER_BYTES {
+            return Ok(empty_metadata());
+        }
+        let opening_line = opening_line
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&opening_line);
+        if !is_delimiter_line(opening_line) {
+            return Ok(empty_metadata());
+        }
+
+        let mut front_matter = String::new();
+        loop {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line)?;
+            consumed += bytes;
+            if bytes == 0 || consumed > MAX_SKILL_FRONTMATTER_BYTES {
+                log::warn!(
+                    "Ignoring missing or oversized Skill frontmatter in '{}'",
+                    path.display()
+                );
+                return Ok(empty_metadata());
+            }
+            if is_delimiter_line(&line) {
+                break;
+            }
+            front_matter.push_str(&line);
+        }
+
+        let meta: SkillMetadata =
+            serde_yaml::from_str(front_matter.trim()).unwrap_or_else(|_| empty_metadata());
 
         Ok(meta)
     }
@@ -4395,6 +4434,148 @@ mod tests {
             repo_name: "repo".to_string(),
             repo_branch: "main".to_string(),
         }
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_requires_frontmatter_at_file_start() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "# Body heading\n---\nname: phantom-skill\n---\nBody\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert!(
+            metadata.name.is_none(),
+            "horizontal rules in the Markdown body must not be treated as frontmatter"
+        );
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_allows_delimiter_text_inside_yaml_value() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: marker-skill\ndescription: \"contains --- inside\"\n---\nBody\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert_eq!(metadata.name.as_deref(), Some("marker-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("contains --- inside"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_accepts_bom_and_crlf_delimiters() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "\u{feff}---\r\nname: portable-skill\r\ndescription: Portable\r\n---\r\nBody\r\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert_eq!(metadata.name.as_deref(), Some("portable-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("Portable"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_rejects_oversized_frontmatter() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        let oversized = "x".repeat(MAX_SKILL_FRONTMATTER_BYTES);
+        fs::write(
+            &skill_md,
+            format!("---\nname: oversized-skill\ndescription: {oversized}\n---\nBody\n"),
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert!(
+            metadata.name.is_none(),
+            "oversized frontmatter must be ignored instead of fully allocated"
+        );
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_stops_reading_at_closing_delimiter() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        let mut contents = b"---\nname: bounded-skill\ndescription: Bounded\n---\n".to_vec();
+        contents.extend(std::iter::repeat_n(0xff, MAX_SKILL_FRONTMATTER_BYTES * 2));
+        fs::write(&skill_md, contents).expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata header");
+
+        assert_eq!(metadata.name.as_deref(), Some("bounded-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("Bounded"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_keeps_indented_delimiter_in_block_scalar() {
+        let temp = tempdir().expect("tempdir");
+        let skill_md = temp.path().join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: block-skill\ndescription: |\n  before\n  ---\n  after\n---\nBody\n",
+        )
+        .expect("write SKILL.md");
+
+        let metadata =
+            SkillService::parse_skill_metadata_static(&skill_md).expect("parse metadata");
+
+        assert_eq!(metadata.name.as_deref(), Some("block-skill"));
+        assert_eq!(metadata.description.as_deref(), Some("before\n---\nafter"));
+    }
+
+    #[test]
+    fn parse_skill_metadata_static_enforces_exact_byte_limit_boundary() {
+        fn manifest_with_size(size: usize) -> Vec<u8> {
+            let prefix = b"---\nname: boundary-skill\ndescription: ";
+            let suffix = b"\n---\n";
+            assert!(size >= prefix.len() + suffix.len());
+            let mut contents = Vec::with_capacity(size);
+            contents.extend_from_slice(prefix);
+            contents.extend(std::iter::repeat_n(
+                b'x',
+                size - prefix.len() - suffix.len(),
+            ));
+            contents.extend_from_slice(suffix);
+            assert_eq!(contents.len(), size);
+            contents
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let exact = temp.path().join("exact.md");
+        let oversized = temp.path().join("oversized.md");
+        fs::write(&exact, manifest_with_size(MAX_SKILL_FRONTMATTER_BYTES))
+            .expect("write exact-boundary manifest");
+        fs::write(
+            &oversized,
+            manifest_with_size(MAX_SKILL_FRONTMATTER_BYTES + 1),
+        )
+        .expect("write oversized manifest");
+
+        let exact_metadata =
+            SkillService::parse_skill_metadata_static(&exact).expect("parse exact boundary");
+        let oversized_metadata =
+            SkillService::parse_skill_metadata_static(&oversized).expect("parse oversized");
+
+        assert_eq!(exact_metadata.name.as_deref(), Some("boundary-skill"));
+        assert!(oversized_metadata.name.is_none());
     }
 
     /// CC_SWITCH_TEST_HOME 隔离守卫（serial 测试间互斥由 #[serial] 保证，
