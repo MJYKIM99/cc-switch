@@ -429,6 +429,10 @@ pub fn anthropic_to_responses(
             obj.remove("max_output_tokens");
             obj.remove("temperature");
             obj.remove("top_p");
+            obj.remove("safety_identifier");
+            obj.remove("prompt_cache_retention");
+            obj.remove("user");
+            obj.remove("metadata");
 
             // —— 兜底必填字段（or_insert：客户端送了什么就保留，否则注入默认值）——
             obj.entry("instructions".to_string()).or_insert(json!(""));

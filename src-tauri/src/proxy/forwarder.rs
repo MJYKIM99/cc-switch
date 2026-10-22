@@ -1572,6 +1572,23 @@ impl RequestForwarder {
             );
         }
 
+        // Official ChatGPT Codex backend is not api.openai.com: Droid/BYOK
+        // clients still send platform-only fields (safety_identifier, …)
+        // that the backend rejects with HTTP 400 Unsupported parameter.
+        if matches!(app_type, AppType::Codex)
+            && codex_official_auth_passthrough
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+            && super::providers::transform_codex_responses_chatgpt_sanitize::sanitize_chatgpt_codex_responses_request(
+                &mut request_body,
+            )
+        {
+            log::debug!(
+                "[Codex] Sanitized ChatGPT-unsupported Responses fields (provider={})",
+                provider.id
+            );
+        }
+
         if matches!(app_type, AppType::Codex | AppType::GrokBuild) {
             self.apply_media_prevention(&mut request_body, provider);
         }
