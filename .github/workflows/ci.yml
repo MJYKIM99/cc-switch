@@ -27,10 +27,9 @@ jobs:
       frontend: ${{ steps.filter.outputs.frontend }}
       backend: ${{ steps.filter.outputs.backend }}
     steps:
-      # On pull_request the filter reads changed files via the API (no checkout);
-      # on push it needs a local git history to diff against.
+      # Pull requests use the files API; push and manual validation use git.
       - name: Checkout
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         uses: actions/checkout@v6
 
       - name: Detect changed paths
