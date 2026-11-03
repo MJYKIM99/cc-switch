@@ -16,9 +16,9 @@ permissions:
 jobs:
   changes:
     name: Detect changed areas
-    # This public fork uses GCP only for trusted pushes. External PR code stays
-    # on GitHub-hosted runners and never reaches the shared self-hosted pool.
-    runs-on: ${{ github.event_name == 'push' && github.repository == 'MJYKIM99/cc-switch' && 'gcp-linux-standard' || 'ubuntu-latest' }}
+    # This public repository uses standard public hosted runners for every
+    # event. It never exposes the private shared self-hosted fleet to PR code.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
@@ -59,7 +59,7 @@ jobs:
 
   frontend:
     name: Frontend Checks
-    runs-on: ${{ github.event_name == 'push' && github.repository == 'MJYKIM99/cc-switch' && 'gcp-linux-standard' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     needs: changes
     # Pushes to main always run everything: they keep the caches that PRs restore from warm.
     if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true'
@@ -106,7 +106,7 @@ jobs:
 
   backend:
     name: Backend Checks
-    runs-on: ${{ github.event_name == 'push' && github.repository == 'MJYKIM99/cc-switch' && matrix.os == 'ubuntu-22.04' && 'gcp-linux-standard' || matrix.os }}
+    runs-on: ${{ matrix.os }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.backend == 'true'
     strategy:
